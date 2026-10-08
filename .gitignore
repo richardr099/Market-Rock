@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+*.egg-info/
+.pytest_cache/
+bin/
+obj/
+/live/
+/state/
+/proposals/
+*.csv
