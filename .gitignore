@@ -6,5 +6,5 @@ bin/
 obj/
 /live/
 /state/
-/proposals/
+/reports/
 *.csv

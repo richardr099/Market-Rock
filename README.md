@@ -1,94 +1,96 @@
 # Market-Rock
 
-A semi-autonomous intraday futures strategy:
+A self-developing intraday futures system:
 
-* **Python** (NumPy/Numba) learns: order-flow and Auction Market Theory features, a
-  conservative backtester, overfitting controls (purged folds, Deflated Sharpe),
-  a trust-region evolution strategy, and Bayesian regime sizing.
-* **NinjaTrader 8** (C#, Rithmic-friendly) executes, behind a hard risk guard for
-  prop-firm rules: intraday trailing drawdown, daily loss, consistency cap.
+* **Python** (NumPy/Numba) invents, tests and manages strategies. Strategies are
+  *genomes* (rules built from order-flow and Auction-Market-Theory conditions). A
+  genetic search invents and tunes them. Each one must pass a statistical gate
+  (Deflated Sharpe with a cumulative trial count, purged folds, an unseen hold-out)
+  and then a **forward paper trial** on data recorded after it was invented.
+* **NinjaTrader 8** (C#, Rithmic-friendly) interprets genomes as data and trades the
+  live portfolio behind a hard prop-firm risk guard: intraday trailing drawdown,
+  daily loss, consistency cap, and a per-trade risk ceiling.
 
-**Semi-autonomous means:** the system may make itself *safer* on its own (shrink
-size, switch off a regime that is losing). It cannot make itself riskier or change
-its strategy logic without a named human running `marketrock promote`. The account's
-hard limits are never writable by the learning loop.
+**The goal it optimises:** maximum long-run account growth (fractional Kelly) while
+keeping the probability of hitting your trailing-drawdown floor at or below 5%.
 
-> No claim of profitability is made. Every number produced so far comes from
-> synthetic data. Read [docs/REPORT.md](docs/REPORT.md), including §0 (what has and
-> hasn't been verified) and §4 (known limits), before connecting a funded account.
+**Autonomy (as configured):**
+
+| Action | Who |
+|---|---|
+| Invent, tune, paper-trade strategies | automatic |
+| Promote a strategy that wins its paper trial (starts at 25% size) | automatic |
+| Grow a strategy's size as live results confirm it | automatic, **up to your ceiling** |
+| Retire a failing strategy; roll back a failed tune | automatic |
+| Hard account limits, the sizing ceiling | **you only** (config + NT8 properties) |
+| Kill switch, rollback/pin | **you** (`halt`, `resume`, `rollback`) |
+
+> No profit claim is made. Every result so far comes from synthetic data. The
+> tests show the machinery finds and exploits an edge *when one exists* and stays
+> flat when none does. Read [docs/REPORT.md](docs/REPORT.md) §0 and §4 before
+> connecting a funded account.
 
 ## Layout
 
 ```
-marketrock/            Python package (research + learning + CLI)
-  features.py          causal features (mirrored exactly in C#)
-  strategy.py          regime filter, AMT signals, pessimistic backtester
-  validation.py        PSR, Deflated Sharpe, purged folds
-  optimizer.py         evolution strategy + Bayesian regime sizing + gate
-  autonomy.py          what may change without a human (de-risk only)
-  store.py             params.json/sha256 bridge, hash-chained ledger
-  cli.py               init | backtest | propose | promote | rollback | verify
-ninjatrader/MarketRockStrategy.cs   the NT8 strategy
+marketrock/
+  features.py    causal features (mirrored exactly in C#)
+  genome.py      strategy-as-data: vocabulary, parse/validate, signals, mutation
+  strategy.py    portfolio backtester (one position at a time, pessimistic fills)
+  evolve.py      genetic search, fitness, statistical gate
+  portfolio.py   lifecycle (PAPER -> LIVE -> RETIRED), Kelly/ruin sizing, monitoring
+  validation.py  PSR, Deflated Sharpe, purged folds
+  store.py       portfolio.txt/sha256 bridge, hash-chained ledger
+  report.py      daily plain-language report
+  cli.py         init | evolve | backtest | halt | resume | rollback | verify
+ninjatrader/MarketRockStrategy.cs   NT8 genome interpreter + risk guard
 tools/nt8-compile-check/            stubbed NT8 API for CI compile checks
 tools/parity/                       replays ticks through the real C# strategy
-tests/                              pytest (incl. Python<->C# parity)
-docs/REPORT.md                      system report: gaps, red-team log, maths
+tests/                              pytest, incl. Python<->C# parity
+docs/REPORT.md                      gaps, red-team log, the maths
 ```
 
-## Daily operation
-
-```
-           NT8 (live)                                Python (nightly, e.g. Task Scheduler)
-  ┌─────────────────────────┐   bars_history.csv  ┌────────────────────────────────────┐
-  │ MarketRockStrategy.cs   │ ──────────────────▶ │ marketrock propose                 │
-  │  hard risk guard        │   trades.csv        │  1. Bayesian regime update         │
-  │  reads params.json      │ ──────────────────▶ │     └─ de-risk → applied (auto)    │
-  │  (hash-verified, loaded │                     │  2. ES search on non-hold-out data │
-  │   at session start)     │ ◀────────────────── │  3. gate: DSR, folds, hold-out     │
-  └─────────────────────────┘   params.json       │     └─ candidate.json + report     │
-                                                  └────────────────────────────────────┘
-                                                        human: marketrock promote
-```
-
-### Setup
+## Setup
 
 1. **NT8:** copy `ninjatrader/MarketRockStrategy.cs` to
-   `Documents\NinjaTrader 8\bin\Custom\Strategies\`, then compile it (NinjaScript Editor, F5).
-2. **Python 3.12+:** `pip install -e .[fast]` (`fast` adds Numba; without it the code
-   runs the same, just slower).
-3. Initialise the live parameters in the folder NT8 reads (the strategy's `Data directory`
-   property; default `Documents\NinjaTrader 8\marketrock`):
+   `Documents\NinjaTrader 8\bin\Custom\Strategies\` and compile it (NinjaScript Editor, F5).
+2. **Python 3.11+:** `pip install -e .[fast]`
+3. **Initialise** in the folder NT8 reads (the strategy's *Data directory*, default
+   `Documents\NinjaTrader 8\marketrock`):
    ```
-   marketrock --live-dir "%USERPROFILE%\Documents\NinjaTrader 8\marketrock" --state-dir state init --approver "Your Name"
+   marketrock --live-dir "<DataDir>" --state-dir state --report-dir reports init --approver "Your Name"
    ```
-4. On a 1-minute chart of the instrument, with tick history loaded, enable the strategy
-   once with **Export historical bars** on. This writes `bars_history.csv`, the
-   training file. Then disable it, turn the option off, and set the **Hard limits**
-   group to your firm's rules. Fill in **Broker liquidation threshold** from your
-   prop-firm dashboard if it shows one.
-5. Enable the strategy on the account (sim first).
+   Then edit `state/config.json`:
+   * `max_risk_per_trade_usd`: **your ceiling on automatic sizing**. To let the system
+     size fully on its own, set it to your hard per-trade limit. To approve every
+     increase yourself, keep it at your current size and raise it when you choose.
+   * Instrument costs (`tick`, `tick_value`, `commission_rt`, `slip_ticks`). **MES is
+     recommended** (`tick_value: 1.25`). With prop-sized drawdowns the optimal size is
+     often below one ES contract (REPORT finding A-21).
+   * `trailing_dd_usd`, `daily_loss_usd`, `buffer_usd`: copy your firm's rules.
+4. On a 1-minute chart with tick history loaded, enable the strategy once with
+   **Export historical bars** on. That writes `bars_history.csv` (training data). Then
+   set the **Hard limits** group, including **Max risk per trade**, and enable it on the
+   account (**sim first**).
 
-### Each night
+## Every night (schedule it, e.g. Windows Task Scheduler)
 
 ```
-marketrock --live-dir <DataDir> --state-dir state --out-dir proposals \
-           --daily-loss 1000 --trailing-dd 2500 \
-           propose --bars <DataDir>/bars_history.csv --trades <DataDir>/trades.csv
+marketrock --live-dir "<DataDir>" --state-dir state --report-dir reports \
+           evolve --bars "<DataDir>/bars_history.csv" --trades "<DataDir>/trades.csv"
 ```
 
-* De-risk changes are applied automatically. NT8 picks them up at the next session start.
-* If `proposals/report.json` says `AWAITING_APPROVAL`, read its `gates` and `changes`,
-  then `marketrock ... promote --approver "Your Name"`.
-* `marketrock ... rollback --to <sha256> --approver "Your Name"` restores any earlier version.
-* `marketrock ... verify` checks the ledger chain and that live params are the last ledgered version.
+Read `reports/<date>.md`. NT8 picks up portfolio changes at the next session start.
 
-Pass the same `--tick/--tick-value/--commission/--slippage` values as your instrument
-(the defaults are ES).
+* `marketrock ... halt --approver "Your Name"`: empty portfolio until `resume`.
+* `marketrock ... rollback --to <sha256> --approver "Your Name"`: restore and pin an
+  earlier portfolio (the hashes are in `state/ledger.jsonl` and `<DataDir>/history/`).
+* `marketrock ... verify`: ledger chain intact and live file equals the last ledgered version.
 
 ## Tests
 
 ```
 pip install -e .[fast,test]
-pytest -q                     # parity test runs only if the .NET 8 SDK is on PATH (or $DOTNET)
+pytest -q                     # parity test runs when the .NET 8 SDK is on PATH (or $DOTNET)
 dotnet build tools/nt8-compile-check
 ```

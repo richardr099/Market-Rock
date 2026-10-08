@@ -1,8 +1,8 @@
 // Market-Rock NT8 execution layer.
 //
-// Mirrors marketrock/features.py + strategy.py. Any change to a feature,
-// signal or rounding rule must be made in BOTH places (tests/test_parity.py
-// checks the shared constants and the parameter bounds table).
+// Mirrors marketrock/features.py, genome.py and strategy.py. Any change to a
+// feature, condition or rounding rule must be made in BOTH places
+// (tests/test_parity.py replays ticks through this file and compares).
 //
 // Design summary (see docs/ARCHITECTURE.md):
 //  * Primary series: 1-minute bars (apply the strategy to a 1-minute chart).
@@ -14,10 +14,14 @@
 //    secondary at equal timestamps, so ticks stamped exactly at the bar end
 //    would otherwise be lost. Entry orders therefore go out at the next bar's
 //    first tick, which is exactly the Python fill model (next bar's open).
-//  * Hard account limits are user-set properties here and nowhere else. The
-//    learning loop can only write params.json, which cannot touch them.
-//  * params.json is accepted only if its SHA-256 matches params.sha256 and
-//    every key is present and in bounds. Otherwise: no new entries.
+//  * Strategies arrive as DATA: portfolio.txt holds up to 8 genomes (rule
+//    text + $ risk). The evolution engine can invent new strategies without
+//    any change to this file; this file only interprets the fixed vocabulary.
+//  * Hard account limits, and MaxRiskPerTradeUsd, are user-set properties here
+//    and nowhere else. The learning loop can only write portfolio.txt.
+//  * portfolio.txt is accepted only if its SHA-256 matches portfolio.sha256,
+//    every genome id equals sha256(rule)[:12], and every value is in bounds.
+//    Otherwise the previous portfolio stays (or, with none, no entries).
 
 #region Using declarations
 using System;
@@ -46,32 +50,36 @@ namespace NinjaTrader.NinjaScript.Strategies
         private const int DeltaZN = 30;
         private const int VolPctL = 1000;
         private const int ErN = 20;
-        private const int RegimeBlock = 0, RegimeRotational = 1, RegimeTrend = 2;
         private const string LongName = "MR_L", ShortName = "MR_S";
 
-        // name, lo, hi -- must equal marketrock/params.py SPECS
-        private static readonly object[][] ParamBounds = new object[][]
-        {
-            new object[] { "va_pct", 0.60, 0.80 },
-            new object[] { "delta_z_entry", 0.00, 3.00 },
-            new object[] { "stop_atr", 0.50, 3.00 },
-            new object[] { "target_rr", 0.80, 3.00 },
-            new object[] { "er_trend", 0.20, 0.70 },
-            new object[] { "max_hold_bars", 5.0, 120.0 },
-            new object[] { "regime_vol_lo", 0.00, 0.40 },
-            new object[] { "regime_vol_hi", 0.60, 1.00 },
-            new object[] { "risk_per_trade_usd", 50.0, 500.0 },
-            new object[] { "max_contracts", 1.0, 10.0 },
-            new object[] { "enable_rotational", 0.0, 1.0 },
-            new object[] { "enable_trend", 0.0, 1.0 },
-            new object[] { "size_mult_rotational", 0.0, 1.0 },
-            new object[] { "size_mult_trend", 0.0, 1.0 },
-        };
+        // ---- genome vocabulary and bounds: must equal marketrock/genome.py ----
+        private const int OpCrossUp = 0, OpCrossDown = 1, OpAbove = 2, OpBelow = 3, OpGe = 4, OpLe = 5, OpTimeIn = 6;
+        private static readonly string[] OpNames = { "CROSS_UP", "CROSS_DOWN", "ABOVE", "BELOW", "GE", "LE", "TIME_IN" };
+        private static readonly string[] LevelNames = { "VAH", "VAL", "POC" };
+        private static readonly string[] FeatNames = { "delta_z", "er", "vol_pct" };
+        private static readonly double[] FeatMin = { -3.0, 0.0, 0.0 };
+        private static readonly double[] FeatMax = { 3.0, 1.0, 1.0 };
+        private const int MaxGenomes = 8;
+        private const int MaxConds = 4;
+        private const int TimeMax = 1440;
+        private const double StopMin = 0.5, StopMax = 3.0, RrMin = 0.8, RrMax = 3.0;
+        private const int HoldMin = 5, HoldMax = 120;
+        private const double MaxRiskFile = 5000.0;
+        private const double VaPct = 0.7;
 
-        // ---- parameters (from params.json) ----
-        private Dictionary<string, double> prm;
-        private string prmHash = "";
-        private bool prmValid;
+        private sealed class Gen
+        {
+            public string Id;
+            public int Dir, Hold, N;
+            public double Stop, Rr, Risk;
+            public readonly int[] Op = new int[MaxConds], Arg = new int[MaxConds];
+            public readonly double[] X = new double[MaxConds], Y = new double[MaxConds];
+        }
+
+        // ---- live portfolio (from portfolio.txt) ----
+        private Gen[] gens = new Gen[0];
+        private string pfHash = "";
+        private bool pfValid;
 
         // ---- pending (closed but not yet finalized) primary bar ----
         private bool pendingBar;
@@ -101,10 +109,13 @@ namespace NinjaTrader.NinjaScript.Strategies
         private double fDz = double.NaN, fVolPct = double.NaN, fEr = double.NaN;
         private int currentSessionId;
 
+        private int barInSession = -1;
+
         // ---- trade state ----
         private int barsHeld;
-        private int entryRegime;
-        private int openTradeRegime;
+        private string entryGenId = "", openGenId = "";
+        private int entryHold, openHold;
+        private double entryStopValue, openStopValue; // $ per contract to the stop
         private int lastTradeCount;
         private bool entryPending;
         private bool exitPending;
@@ -127,7 +138,7 @@ namespace NinjaTrader.NinjaScript.Strategies
             if (State == State.SetDefaults)
             {
                 Name = "MarketRockStrategy";
-                Description = "AMT value-area / order-flow strategy with hard prop-firm risk guard.";
+                Description = "Self-developing order-flow strategy portfolio with hard prop-firm risk guard.";
                 Calculate = Calculate.OnBarClose;
                 EntriesPerDirection = 1;
                 EntryHandling = EntryHandling.AllEntries;
@@ -152,6 +163,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                 ConsistencyMaxPct = 0.30;
                 ConsistencyBaseUsd = 3000;
                 KnownFloorUsd = 0;
+                MaxRiskPerTradeUsd = 250;
                 CommissionPerContractRt = 4.5;
                 ReconnectCooldownSec = 30;
                 StaleDataSec = 20;
@@ -170,7 +182,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                 sessionIterator = new SessionIterator(BarsArray[0]);
                 guard = NewGuard();
                 Directory.CreateDirectory(DataDir);
-                TryLoadParams(true);
+                TryLoadPortfolio(true);
                 if (ExportHistory)
                     barLog = OpenCsv("bars_history.csv", "time,session,open,high,low,close,volume,buy_volume,sell_volume", false);
             }
@@ -183,7 +195,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                 lastTradeCount = SystemPerformance.AllTrades.Count;
                 if (barLog != null) { barLog.Flush(); barLog.Dispose(); }
                 barLog = OpenCsv("bars.csv", "time,session,open,high,low,close,volume,buy_volume,sell_volume", true);
-                tradeLog = OpenCsv("trades.csv", "exit_time,session,regime,direction,qty,pnl_usd,params_sha256", true);
+                tradeLog = OpenCsv("trades.csv", "exit_time,session,genome,direction,qty,pnl_usd,risk_usd,portfolio_sha256", true);
                 guard.NewDay(currentSessionId); // re-anchor the day if we go live mid-session
                 needReconcile = true;
                 startupReconcile = true;
@@ -292,10 +304,11 @@ namespace NinjaTrader.NinjaScript.Strategies
                 RollProfile(tick);
                 guard.NewDay(pendingSessionId);
                 if (Position.MarketPosition == MarketPosition.Flat) { entryPending = false; exitPending = false; }
-                TryLoadParams(false); // promotions take effect at session boundaries only
+                TryLoadPortfolio(false); // portfolio changes take effect at session boundaries only
             }
-            else if (!prmValid)
-                TryLoadParams(false);
+            else if (!pfValid)
+                TryLoadPortfolio(false);
+            barInSession = pendingFirstOfSession || barInSession < 0 ? 0 : barInSession + 1;
 
             // --- volume profile: uniform distribution over the bar's ticks ---
             long a = Level(pLow, tick), b = Level(pHigh, tick);
@@ -371,58 +384,72 @@ namespace NinjaTrader.NinjaScript.Strategies
                 if (barCount % 30 == 0) barLog.Flush();
             }
 
-            // --- time exit ---
+            // --- time exit (per the genome that opened the position) ---
             if (Position.MarketPosition != MarketPosition.Flat)
             {
                 barsHeld++;
-                if (prmValid && barsHeld >= (int)prm["max_hold_bars"])
+                if (openHold > 0 && barsHeld >= openHold)
                     FlattenStrategy("time");
             }
 
-            // --- regime + signal ---
-            if (!prmValid || double.IsNaN(prevClose) || double.IsNaN(dz) || double.IsNaN(volPct)
-                || double.IsNaN(er) || double.IsNaN(atr) || double.IsNaN(sessVah))
+            // --- genome signals: first genome (portfolio order) whose conditions all hold ---
+            if (!pfValid || double.IsNaN(prevClose) || double.IsNaN(dz) || double.IsNaN(volPct) || double.IsNaN(er)
+                || double.IsNaN(atr) || double.IsNaN(sessVah) || double.IsNaN(sessVal) || double.IsNaN(sessPoc))
                 return;
-            int regime = RegimeBlock;
-            if (volPct >= prm["regime_vol_lo"] && volPct <= prm["regime_vol_hi"])
-                regime = er >= prm["er_trend"] ? RegimeTrend : RegimeRotational;
-            if (regime == RegimeBlock) return;
-
-            double thr = prm["delta_z_entry"];
-            int sig = 0;
-            if (regime == RegimeRotational && prm["enable_rotational"] > 0.5)
+            Gen hit = null;
+            for (int gi = 0; gi < gens.Length && hit == null; gi++)
             {
-                if (prevClose < sessVal && pClose >= sessVal && dz >= thr) sig = 1;
-                else if (prevClose > sessVah && pClose <= sessVah && dz <= -thr) sig = -1;
-            }
-            else if (regime == RegimeTrend && prm["enable_trend"] > 0.5)
-            {
-                if (prevClose <= sessVah && pClose > sessVah && dz >= thr) sig = 1;
-                else if (prevClose >= sessVal && pClose < sessVal && dz <= -thr) sig = -1;
+                Gen g = gens[gi];
+                bool all = true;
+                for (int k = 0; k < g.N && all; k++)
+                    all = CondTrue(g, k, prevClose, pClose, dz, er, volPct);
+                if (all) hit = g;
             }
             bool stale = staleSinceLastBar;
             staleSinceLastBar = false;
-            if (sig == 0 || nextTickIsNewSession || stale || entryPending) return;
+            if (hit == null || nextTickIsNewSession || stale || entryPending) return;
             if (Position.MarketPosition != MarketPosition.Flat) return;
             if (!guard.CanEnter() || !HealthyForEntry()) return;
 
-            int stopTicks = Math.Max(1, (int)Math.Floor(prm["stop_atr"] * atr / tick + 0.5));
-            int tgtTicks = Math.Max(1, (int)Math.Floor(stopTicks * prm["target_rr"] + 0.5));
+            int stopTicks = Math.Max(1, (int)Math.Floor(hit.Stop * atr / tick + 0.5));
+            int tgtTicks = Math.Max(1, (int)Math.Floor(stopTicks * hit.Rr + 0.5));
             double tickValue = Instrument.MasterInstrument.PointValue * tick;
-            double mult = regime == RegimeRotational ? prm["size_mult_rotational"] : prm["size_mult_trend"];
-            int qty = (int)Math.Floor(prm["risk_per_trade_usd"] * mult / (stopTicks * tickValue));
-            qty = Math.Min(qty, (int)prm["max_contracts"]);
+            double risk = Math.Min(hit.Risk, MaxRiskPerTradeUsd); // the user's ceiling always wins
+            int qty = (int)Math.Floor(risk / (stopTicks * tickValue));
             // Pre-trade: the worst case of this trade must fit inside BOTH limits.
             double lossPerContract = stopTicks * tickValue + CommissionPerContractRt + 2 * tickValue;
             qty = guard.AllowedQty(qty, lossPerContract);
             if (qty < 1) return;
 
-            entryRegime = regime;
-            string name = sig > 0 ? LongName : ShortName;
+            entryGenId = hit.Id;
+            entryHold = hit.Hold;
+            entryStopValue = stopTicks * tickValue;
+            string name = hit.Dir > 0 ? LongName : ShortName;
             SetStopLoss(name, CalculationMode.Ticks, stopTicks, false);
             SetProfitTarget(name, CalculationMode.Ticks, tgtTicks);
             entryPending = true;
-            if (sig > 0) EnterLong(0, qty, name); else EnterShort(0, qty, name);
+            if (hit.Dir > 0) EnterLong(0, qty, name); else EnterShort(0, qty, name);
+        }
+
+        private bool CondTrue(Gen g, int k, double prevClose, double c, double dz, double er, double volPct)
+        {
+            int a = g.Arg[k];
+            switch (g.Op[k])
+            {
+                case OpCrossUp: { double L = LevelOf(a); return prevClose <= L && c > L; }
+                case OpCrossDown: { double L = LevelOf(a); return prevClose >= L && c < L; }
+                case OpAbove: return c > LevelOf(a);
+                case OpBelow: return c < LevelOf(a);
+                case OpGe: return (a == 0 ? dz : a == 1 ? er : volPct) >= g.X[k];
+                case OpLe: return (a == 0 ? dz : a == 1 ? er : volPct) <= g.X[k];
+                case OpTimeIn: return barInSession >= g.X[k] && barInSession < g.Y[k];
+            }
+            return false;
+        }
+
+        private double LevelOf(int a)
+        {
+            return a == 0 ? sessVah : a == 1 ? sessVal : sessPoc;
         }
 
         private void RollProfile(double tick)
@@ -434,7 +461,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                 foreach (var kv in hist) h[kv.Key - histLo] = kv.Value;
                 double total = 0; int poc = 0;
                 for (int k = 0; k < n; k++) { total += h[k]; if (h[k] > h[poc]) poc = k; }
-                int lo = poc, hi = poc; double acc = h[poc], target = prm != null && prmValid ? prm["va_pct"] * total : 0.7 * total;
+                int lo = poc, hi = poc; double acc = h[poc], target = VaPct * total;
                 while (acc < target && (lo > 0 || hi < n - 1))
                 {
                     double up = hi < n - 1 ? h[hi + 1] : -1.0;
@@ -527,7 +554,11 @@ namespace NinjaTrader.NinjaScript.Strategies
             {
                 if (orderState == OrderState.Filled || orderState == OrderState.Rejected || orderState == OrderState.Cancelled)
                     entryPending = false;
-                if (orderState == OrderState.Filled) { barsHeld = 0; openTradeRegime = entryRegime; }
+                if (orderState == OrderState.Filled)
+                {
+                    barsHeld = 0;
+                    openGenId = entryGenId; openHold = entryHold; openStopValue = entryStopValue;
+                }
             }
             if (order.Name.StartsWith("MR_X_") && (orderState == OrderState.Cancelled || orderState == OrderState.Rejected))
                 exitPending = false; // allow a retry on the next tick
@@ -555,8 +586,8 @@ namespace NinjaTrader.NinjaScript.Strategies
                     long epoch = (long)(TimeZoneInfo.ConvertTimeToUtc(tr.Exit.Time, NinjaTrader.Core.Globals.GeneralOptions.TimeZoneInfo)
                         - new DateTime(1970, 1, 1, 0, 0, 0, DateTimeKind.Utc)).TotalSeconds;
                     int dir = tr.Entry.MarketPosition == MarketPosition.Long ? 1 : -1;
-                    tradeLog.WriteLine(string.Format(CultureInfo.InvariantCulture, "{0},{1},{2},{3},{4},{5},{6}",
-                        epoch, currentSessionId, openTradeRegime, dir, tr.Quantity, pnl, prmHash));
+                    tradeLog.WriteLine(string.Format(CultureInfo.InvariantCulture, "{0},{1},{2},{3},{4},{5},{6},{7}",
+                        epoch, currentSessionId, openGenId, dir, tr.Quantity, pnl, openStopValue * tr.Quantity, pfHash));
                     tradeLog.Flush();
                 }
             }
@@ -566,56 +597,129 @@ namespace NinjaTrader.NinjaScript.Strategies
         }
 
         // ------------------------------------------------------------------
-        // Parameters
+        // Portfolio loading (fail closed)
         // ------------------------------------------------------------------
-        private void TryLoadParams(bool initial)
+        private static string Sha256Hex(byte[] bytes)
         {
-            string jsonPath = Path.Combine(DataDir, "params.json"), shaPath = Path.Combine(DataDir, "params.sha256");
+            using (SHA256 sha = SHA256.Create())
+                return BitConverter.ToString(sha.ComputeHash(bytes)).Replace("-", "").ToLowerInvariant();
+        }
+
+        private static double Num(string v)
+        {
+            double x = double.Parse(v, NumberStyles.Float, CultureInfo.InvariantCulture);
+            if (double.IsNaN(x) || double.IsInfinity(x)) throw new InvalidDataException("non-finite number");
+            return x;
+        }
+
+        private static int IndexOf(string[] names, string v)
+        {
+            int i = Array.IndexOf(names, v);
+            if (i < 0) throw new InvalidDataException("unknown token " + v);
+            return i;
+        }
+
+        private static void Check(bool ok, string what)
+        {
+            if (!ok) throw new InvalidDataException(what);
+        }
+
+        private static Gen ParseRule(string id, string rule, double risk)
+        {
+            Check(Sha256Hex(Encoding.ASCII.GetBytes(rule)).Substring(0, 12) == id, "genome id does not match rule");
+            var kv = new Dictionary<string, string>();
+            foreach (string part in rule.Split(';'))
+            {
+                int e = part.IndexOf('=');
+                Check(e > 0, "bad rule part");
+                kv[part.Substring(0, e)] = part.Substring(e + 1);
+            }
+            var g = new Gen { Id = id, Risk = risk };
+            g.Dir = int.Parse(kv["dir"], CultureInfo.InvariantCulture);
+            g.Stop = Num(kv["stop"]);
+            g.Rr = Num(kv["rr"]);
+            g.Hold = int.Parse(kv["hold"], CultureInfo.InvariantCulture);
+            Check(g.Dir == 1 || g.Dir == -1, "dir");
+            Check(g.Stop >= StopMin && g.Stop <= StopMax && g.Rr >= RrMin && g.Rr <= RrMax && g.Hold >= HoldMin && g.Hold <= HoldMax, "exit bounds");
+            string[] conds = kv["c"].Split('|');
+            Check(conds.Length >= 1 && conds.Length <= MaxConds, "condition count");
+            g.N = conds.Length;
+            for (int k = 0; k < conds.Length; k++)
+            {
+                string[] t = conds[k].Split(' ');
+                int op = IndexOf(OpNames, t[0]);
+                g.Op[k] = op;
+                if (op <= OpBelow) { Check(t.Length == 2, "level arity"); g.Arg[k] = IndexOf(LevelNames, t[1]); }
+                else if (op == OpGe || op == OpLe)
+                {
+                    Check(t.Length == 3, "feature arity");
+                    int f = IndexOf(FeatNames, t[1]);
+                    g.Arg[k] = f;
+                    g.X[k] = Num(t[2]);
+                    Check(g.X[k] >= FeatMin[f] && g.X[k] <= FeatMax[f], "threshold bounds");
+                }
+                else
+                {
+                    Check(t.Length == 3, "time arity");
+                    g.X[k] = int.Parse(t[1], CultureInfo.InvariantCulture);
+                    g.Y[k] = int.Parse(t[2], CultureInfo.InvariantCulture);
+                    Check(g.X[k] >= 0 && g.X[k] < g.Y[k] && g.Y[k] <= TimeMax, "time bounds");
+                }
+            }
+            return g;
+        }
+
+        private void TryLoadPortfolio(bool initial)
+        {
+            string txtPath = Path.Combine(DataDir, "portfolio.txt"), shaPath = Path.Combine(DataDir, "portfolio.sha256");
             try
             {
-                if (!File.Exists(jsonPath) || !File.Exists(shaPath))
+                if (!File.Exists(txtPath) || !File.Exists(shaPath))
                 {
-                    if (initial) Log("MarketRock: params.json/params.sha256 missing - strategy will not trade", LogLevel.Error);
-                    if (initial) prmValid = false;
+                    if (initial) { Log("MarketRock: portfolio.txt/portfolio.sha256 missing - strategy will not trade", LogLevel.Error); pfValid = false; }
                     return;
                 }
-                byte[] bytes = File.ReadAllBytes(jsonPath);
+                byte[] bytes = File.ReadAllBytes(txtPath);
                 string want = File.ReadAllText(shaPath).Trim().ToLowerInvariant();
-                string got;
-                using (SHA256 sha = SHA256.Create())
-                    got = BitConverter.ToString(sha.ComputeHash(bytes)).Replace("-", "").ToLowerInvariant();
-                if (got == prmHash && prmValid) return; // unchanged
+                string got = Sha256Hex(bytes);
+                if (got == pfHash && pfValid) return; // unchanged
                 if (got != want)
                 {
-                    // Possibly mid-write: keep the last verified set, retry next bar.
-                    Log("MarketRock: params hash mismatch - keeping previous parameters", LogLevel.Warning);
-                    if (initial) prmValid = false;
+                    // Possibly mid-write: keep the last verified portfolio, retry next bar.
+                    Log("MarketRock: portfolio hash mismatch - keeping previous portfolio", LogLevel.Warning);
+                    if (initial) pfValid = false;
                     return;
                 }
-                var parsed = new Dictionary<string, double>();
-                foreach (Match m in Regex.Matches(Encoding.ASCII.GetString(bytes), "\"([a-z_]+)\"\\s*:\\s*([-+0-9.eE]+)"))
-                    parsed[m.Groups[1].Value] = double.Parse(m.Groups[2].Value, NumberStyles.Float, CultureInfo.InvariantCulture);
-                if (parsed.Count != ParamBounds.Length)
-                    throw new InvalidDataException("unexpected key count " + parsed.Count);
-                foreach (object[] b in ParamBounds)
+                var kv = new Dictionary<string, string>();
+                foreach (string line in Encoding.ASCII.GetString(bytes).Split('\n'))
                 {
-                    string k = (string)b[0];
-                    double v;
-                    if (!parsed.TryGetValue(k, out v)) throw new InvalidDataException("missing " + k);
-                    if (double.IsNaN(v) || v < (double)b[1] - 1e-12 || v > (double)b[2] + 1e-12)
-                        throw new InvalidDataException(k + " out of bounds: " + v);
+                    if (line.Length == 0) continue;
+                    int e = line.IndexOf('=');
+                    Check(e > 0, "bad line");
+                    kv[line.Substring(0, e)] = line.Substring(e + 1);
                 }
-                prm = parsed;
-                prmHash = got;
-                prmValid = true;
-                Log("MarketRock: loaded params " + got.Substring(0, 12), LogLevel.Information);
+                Check(kv["version"] == "2", "version");
+                Check(Num(kv["va_pct"]) == VaPct, "va_pct");
+                int n = int.Parse(kv["n"], CultureInfo.InvariantCulture);
+                Check(n >= 0 && n <= MaxGenomes, "genome count");
+                var loaded = new Gen[n];
+                for (int i = 0; i < n; i++)
+                {
+                    string p = "g" + i.ToString(CultureInfo.InvariantCulture) + ".";
+                    double risk = Num(kv[p + "risk_usd"]);
+                    Check(risk >= 0 && risk <= MaxRiskFile, "risk bounds");
+                    loaded[i] = ParseRule(kv[p + "id"], kv[p + "rule"], risk);
+                }
+                gens = loaded;
+                pfHash = got;
+                pfValid = true;
+                Log("MarketRock: loaded portfolio " + got.Substring(0, 12) + " (" + n.ToString(CultureInfo.InvariantCulture) + " strategies)", LogLevel.Information);
             }
             catch (Exception ex)
             {
-                // Fail closed: a bad file never replaces a good one, and with no
-                // good one there are no entries.
-                Log("MarketRock: params rejected: " + ex.Message, LogLevel.Error);
-                if (initial) prmValid = false;
+                // Fail closed: a bad file never replaces a good one; with no good one there are no entries.
+                Log("MarketRock: portfolio rejected: " + ex.Message, LogLevel.Error);
+                if (initial) pfValid = false;
             }
         }
 
@@ -776,6 +880,10 @@ namespace NinjaTrader.NinjaScript.Strategies
         [NinjaScriptProperty, Range(0, double.MaxValue)]
         [Display(Name = "Broker liquidation threshold (USD, 0 = unknown)", GroupName = "1. Hard limits", Order = 9)]
         public double KnownFloorUsd { get; set; }
+
+        [NinjaScriptProperty, Range(0, 5000)]
+        [Display(Name = "Max risk per trade (USD) - ceiling on automatic sizing", GroupName = "1. Hard limits", Order = 10)]
+        public double MaxRiskPerTradeUsd { get; set; }
 
         [NinjaScriptProperty, Range(0, 100)]
         [Display(Name = "Commission per contract round trip", GroupName = "2. Execution", Order = 1)]

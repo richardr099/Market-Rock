@@ -1,27 +1,25 @@
 # Market-Rock — System Report
 
-Status as of the first commit. Each claim below carries its evidence. Where
+Status as of v2 (self-developing portfolio). Each claim below carries its evidence. Where
 something has not been verified, the report says so.
 
 ---
 
-## 0. What was actually run vs. only reasoned about
+## 0. What was actually run vs. only reasoned about (v2)
 
 | Item | Status | Evidence |
 |---|---|---|
-| Python pipeline (features, backtest, validation, optimizer, autonomy, ledger, CLI) | **Run** | `pytest tests` → 23 passed |
-| Gate rejects pure noise | **Run** | `tests/test_gate.py::test_noise_is_rejected_and_promote_refuses` |
-| Gate *can* approve a real (planted) edge | **Run** | `tests/test_gate.py::test_planted_edge_passes_gate_then_human_promotes` |
-| C# strategy compiles | **Run, against stubs only** | `dotnet build tools/nt8-compile-check` (C# language version 5). The stubs are my reading of the NT8 API, not the real assemblies. |
-| C# ↔ Python parity (bars, tick-rule volume, all 7 features, every entry decision) | **Run** through the real `MarketRockStrategy.cs` code | `tests/test_parity.py::test_csharp_replay_matches_python` (needs the .NET SDK) |
-| Tests detect injected bugs | **Run** | Mutations caught: profile lookahead, autonomy bypass, sample-vs-population std in C#, value-area tie direction in C#. One mutation not caught: C# percentile `<` → `<=`. It only differs on exact float ties, which this data never produces. |
-| Compiles inside real NinjaTrader 8 | **NOT verified** | No NT8 in this environment. Press F5 in the NinjaScript Editor before anything else. |
-| Rithmic disconnect / reconnect behaviour | **NOT verified** | The code path exists and compiles. It has not been exercised against a live Rithmic feed. |
-| NT8 historical fills of managed stop/target vs the Python fill model | **NOT verified** | Python resolves stop and target hit in the same bar as a stop. NT8 uses its own intrabar fill logic. |
-| Whether NT8 calls `OnOrderUpdate` / `OnExecutionUpdate` on the same thread as `OnBarUpdate` | **NOT verified** | See finding A-15. |
-| **The strategy has an edge on real futures data** | **No evidence either way** | No real tick data was available in this environment. Every performance number in this repository is from synthetic data. |
-
----
+| Python pipeline: genomes, simulator, evolution, gate, lifecycle, sizing, ledger, CLI, report | **Run** | `pytest tests` → 29 passed |
+| Unattended nightly loop on noise never puts a strategy live | **Run** | `tests/test_evolve.py::test_noise_never_goes_live` (4 nights, >300 strategies evaluated) |
+| Loop discovers a planted edge, paper-trades it on forward data, promotes it within the user's ceiling, with no clones | **Run** | `tests/test_evolve.py::test_planted_edge_is_discovered_paper_traded_and_promoted` |
+| Kill switch, resume, rollback/pin, trade-log tamper detection | **Run** | `tests/test_evolve.py::test_halt_resume_rollback_and_log_rotation` |
+| Failing live strategy retired; failed tune auto-rolls back to its parent | **Run** | `tests/test_portfolio.py` |
+| C# genome interpreter compiles | **Run, against stubs only** | `dotnet build tools/nt8-compile-check` (C# language version 5), 0 warnings |
+| C# ↔ Python parity: bars, tick-rule volume, 8 features, and every entry decision of a 5-genome portfolio covering all 7 condition types | **Run** through the real `MarketRockStrategy.cs` | `tests/test_parity.py::test_csharp_replay_matches_python` |
+| Tests detect injected bugs | **Run** | Mutations caught: paper trial always passes, clone filter off, C# `CROSS_UP` boundary, C# `TIME_IN` boundary (v2); plus the v1 set |
+| Compiles inside real NinjaTrader 8 / behaves correctly on Rithmic | **NOT verified** | No NT8 here. Press F5 in the NinjaScript Editor; run on sim first. |
+| NT8 threading model (finding A-15) | **NOT verified** | Still open. |
+| **The system makes money on real futures data** | **No evidence either way** | Synthetic data only. The planted-edge test proves the machinery can find and exploit an edge *when one exists*. It says nothing about whether ES has one at this frequency. |
 
 ## 1. GitHub gap analysis
 
@@ -72,6 +70,11 @@ nights. Without that, a nightly optimizer is a machine for finding luck.
 * *Hundreds of factors.* More search dimensions raise the deflation penalty
   faster than they raise the true signal at this trade frequency.
 
+**v2 adds:** strategy invention by genetic search over a genome vocabulary
+(the GA-engine idea, kept small so the deflation penalty stays meaningful),
+a forward paper trial before any capital, and Kelly sizing under a ruin
+constraint.
+
 **Not integrated, still a gap:** multi-instrument and portfolio construction;
 L2 order-book features (we classify volume with the tick rule, typically about
 75–85% agreement with quote-based classification in the literature); queue
@@ -81,8 +84,11 @@ position and market-replay fill realism; an on-chart status panel.
 
 ## 2. Adversarial findings (red-team log)
 
-Every item below was found while building this commit and fixed in it.
-"Proof" names the test that fails if the fix is removed, where one exists.
+Found and fixed in v1. All still apply to v2 except where noted: `params.json`
+is now `portfolio.txt`; A-12's `promote` command no longer exists (v2
+promotes automatically through the paper trial; halt/pin replace it, A-22);
+A-17's trade-log check is now proven by `test_halt_resume_rollback_and_log_rotation`.
+v1 test names in this table refer to the v1 commit (`b29d433`).
 
 | # | Severity | Finding | Fix | Proof |
 |---|---|---|---|---|
@@ -112,93 +118,99 @@ in `State.Terminated`; `Print` is throttled.
 
 ---
 
-## 3. The self-improvement mechanism
+## 3. The self-improvement mechanism (v2: self-developing)
 
-Two learners. They run on different evidence, with different authority.
+The objective is to **maximise expected long-run growth of the account
+(fractional Kelly), subject to P(hitting the trailing-drawdown floor) ≤
+`ruin_prob` (5%)**. Raw profit is never the objective.
 
-### 3.1 Alpha parameters: trust-region evolution strategy (proposes, never applies)
+### 3.1 Strategies are data (genomes)
 
-Search space: θ = (va_pct, delta_z_entry, stop_atr, target_rr, er_trend,
-max_hold_bars, regime_vol_lo, regime_vol_hi), mapped to unit space
-u ∈ [0,1]^8 via uᵢ = (θᵢ − loᵢ)/(hiᵢ − loᵢ).
+A genome is a direction, a conjunction of 1–4 conditions, and an exit:
 
-**Proposal (one night).** Incumbent u₀; step size σ (persisted); λ = 24.
+    dir=-1;stop=1.25;rr=1.5;hold=30;c=LE delta_z -1.0|LE er 0.4
 
-  uₖ = clip( u₀ + clip(σ·zₖ, −Δ, +Δ), 0, 1 ),  zₖ ~ N(0, I)
+Conditions: `CROSS_UP/CROSS_DOWN/ABOVE/BELOW {VAH,VAL,POC}`,
+`GE/LE {delta_z, er, vol_pct} x`, `TIME_IN a b`. NT8 interprets the same text,
+so a strategy invented tonight trades tomorrow without code changes. It runs
+only on interpreter code the parity test has verified. The system can invent
+any strategy expressible in that vocabulary. It cannot invent new code, which
+is deliberate (see §5).
 
-Δᵢ = `max_step` (default 0.10). No parameter can move more than 10% of its
-range per night, however good a candidate looks. The RNG seed is
-SHA-256(bar bytes ‖ incumbent hash ‖ n_trials), so a night is reproducible.
+### 3.2 Nightly loop (`marketrock evolve`, unattended)
 
-**Fitness (search slice only).** Daily P&L series d, split into K = 5
-contiguous session folds with a 1-session embargo; Sₖ = mean(d_k)/std(d_k).
+1. **Learn from live fills.** Each live trade is converted to an R-multiple
+   (P&L ÷ planned risk) and attributed to the genome that opened it.
+2. **Retire failures.** For a LIVE genome with n ≥ 10 live trades, let μ_f
+   and σ_f be the mean and SD of its forward-trial R-multiples. Then
+   z = (mean_live − μ_f)/(σ_f/√n). Retire if z < −2.5, or if n ≥ 30 and the
+   live t-stat is < −1, or if cumulative live R < −10. If the retired genome
+   was a tune that had replaced its parent, the parent goes back to LIVE
+   (**auto-rollback**).
+3. **Paper trials.** For each PAPER genome, simulate it on bars recorded
+   *after its birth*, which no search has scored it on, using the same
+   pessimistic fill model. With forward stats (n, mean, t) and backtest mean
+   μ_b:
+     pass ⇔ n ≥ 20 ∧ t ≥ 1.0 ∧ (mean − 0.5·μ_b)/(σ_b/√n) ≥ −2
+   The 0.5 is the Harvey–Liu haircut: the winner of a search is always
+   optimistic in-sample (finding A-18). A tuned child must also beat its
+   parent's forward mean over the same window. Winners go LIVE at
+   `start_stage` = 25%. Losers are REJECTED. A trial that hasn't reached 20
+   trades within 60 sessions expires.
+4. **Invent and tune.** A genetic search (population 32, 4 generations,
+   tournament selection, crossover, mutation) seeded with the AMT seeds plus
+   every LIVE/PAPER genome, and small parameter-only mutations of each LIVE
+   genome. Fitness on the search slice only:
+     F = mean_k S_k − 0.5·std_k S_k − 0.01·n_conditions  (purged 5-fold, per-session Sharpe)
+5. **Gate.** Same as v1: Deflated Sharpe ≥ 0.95 using the *cumulative* trial
+   count, ≥ 4/5 positive folds, and a hold-out the search never saw (not blown,
+   ≥ 15 trades, profitable, drawdown ≤ 50% of the limit). Candidates whose
+   entry bars overlap an existing LIVE/PAPER genome by Jaccard > 0.5 are
+   dropped as clones (finding A-19). Survivors become PAPER.
+6. **Size** (below), **publish** `portfolio.txt` + hash, write the ledger and
+   the daily report.
 
-  F(θ) = mean_k Sₖ − 0.5 · std_k Sₖ,  F = −∞ if the account was blown or trades < 60
+### 3.3 Sizing: fractional Kelly under a ruin constraint
 
-The penalty rewards a parameter set that works in every fold over one that
-works brilliantly in one.
+For each LIVE genome, pool forward and live R-multiples, then shrink toward
+zero with n₀ = 20 pseudo-trades:
 
-**Step-size adaptation (Rechenberg's 1/5 rule).**
+    mean = ΣR/(n+n₀),  σ² = max(sample var, 0.5²),  μ_lo = mean − σ/√(n+n₀)
+    D = (trailing_dd − buffer) / n_live                (drawdown room per strategy)
+    r_kelly = kelly_fraction · μ_lo/σ² · D             (half-Kelly by default)
+    r_ruin  = 2·μ_lo·D / (σ²·ln(1/ruin_prob))          (drifted random walk: P(ruin) = exp(−2μD/σ²r))
+    stage   = min(1, 0.25 + 0.75·n_live_trades/50)
+    risk    = min(stage·min(r_kelly, r_ruin), max_risk_per_trade_usd), floored at probe_risk_usd
 
-  σ ← clip( σ · exp( 1[F(best) > F(incumbent)] − 0.2 ), 0.01, 0.10 )
+Sizing moves up only on **lower-bound** evidence. It grows with live
+confirmation and can never exceed **your** `max_risk_per_trade_usd`. NT8
+additionally clamps to its own `MaxRiskPerTradeUsd` property and to the live
+drawdown room (`RiskGuard.AllowedQty`).
 
-**Gate (all must pass).** With N = cumulative trials ever, T sessions,
-γ₃ skew, γ₄ kurtosis of d, and V = cross-candidate variance of SR:
+### 3.4 What you control
 
-  SR₀ = √V · [ (1−γ)·Φ⁻¹(1 − 1/N) + γ·Φ⁻¹(1 − 1/(N·e)) ],  γ = 0.5772…  
-  DSR = Φ( (SR − SR₀)·√(T−1) / √(1 − γ₃·SR + (γ₄−1)/4 · SR²) ) ≥ 0.95
+`state/config.json`: `max_risk_per_trade_usd` (sizing ceiling),
+`ruin_prob`, `kelly_fraction`, slot counts, trial lengths, instrument costs,
+`halted`. Commands: `halt`, `resume`, `rollback --to <sha>` (pins the live
+portfolio until `resume`). NT8 properties: every hard account limit, plus
+`MaxRiskPerTradeUsd`. None of these are writable by the learning loop.
 
-plus: at least 4 of 5 folds positive; on the hold-out (default the last 20
-sessions, never seen by the search): not blown, ≥ 15 trades, net P&L > 0,
-Sharpe ≥ incumbent's hold-out Sharpe, max drawdown ≤ 50% of the trailing
-limit.
+### 3.5 v2 adversarial findings
 
-**Then a human.** `marketrock promote --approver "<name>"` is the only path
-to live for these parameters. Every promotion is a hash-chained ledger entry.
-
-### 3.2 Regime sizing: Bayesian lower-confidence-bound Kelly (may only de-risk on its own)
-
-For each regime r ∈ {rotational, trend}, from **live fills** only:
-
-* Win probability: pᵣ ~ Beta(αᵣ, βᵣ), prior Beta(2, 2). Each new session first
-  decays the evidence toward the prior,
-   α ← 2 + 0.97·(α − 2),  β ← 2 + 0.97·(β − 2),
-  then adds that session's wins to α and losses to β. The effective memory is
-  about 1/(1−0.97) ≈ 33 sessions, so the posterior tracks regime drift.
-* Payoff ratio: b = (decayed mean win)/(decayed mean loss); defaults to
-  `target_rr` until both exist.
-* Kelly fraction at posterior quantiles q:
-   f(q) = p_q − (1 − p_q)/b
-* Decision:
-   if f(0.95) ≤ 0 → disable the regime (even the optimistic case has no edge);  
-   otherwise multiplier m = clip( f(0.05) / 0.10, 0.25, 1 ).
-
-  A regime reaches full size only when the *pessimistic* Kelly reaches 10%.
-  With little evidence it trades at 25% ("probation"). It is switched off only
-  when the data rule out an edge with 95% confidence, not merely when the data
-  are thin.
-
-**Authority (semi-autonomy).** `autonomy.split_changes` classifies each change
-by the parameter's `risk_dir`. Lowering a multiplier, disabling a regime,
-cutting `max_contracts`/`risk_per_trade_usd`, or narrowing the volatility band
-is applied to live automatically (ledger approver `auto:derisk`). Raising any
-of them, re-enabling a regime, or touching any alpha parameter goes to the
-human candidate. `apply_derisk` re-checks its own output and raises if
-anything non-derisk slipped through.
-
-### 3.3 What cannot be learned
-
-Trailing drawdown, daily loss limit, consistency cap, safety buffer and the
-broker floor are NinjaScript properties set by the user. They are not in
-`params.json`, so no output of the learning loop can loosen them.
-
----
+| # | Severity | Finding | Fix | Proof |
+|---|---|---|---|---|
+| A-18 | High (lost edge) | The paper trial compared forward results with the raw backtest. A real edge (+0.105R over 232 forward trades) was rejected because the search winner's in-sample mean is always inflated. | Compare with a 50%-haircut backtest; the forward t-stat ≥ 1 must still hold on its own. | smoke run: rejected before, promoted after; `test_paper_trial_rejects_strategy_without_forward_edge` keeps the no-edge case rejected |
+| A-19 | High (false diversification) | Live slots filled with near-identical genomes (e.g. max-hold 36 vs 38). They fire on the same bars, add no diversification, and split the drawdown budget. | Jaccard clone filter on entry bars at admission. | planted-edge test asserts live overlap ≤ 0.6; mutant (filter off) caught |
+| A-20 | Medium | The stage multiplied *after* the ceiling, so a 25%-stage genome could never reach the ceiling even when its optimal size was far above it. | risk = min(stage·optimal, ceiling). | `test_sizing_is_capped_staged_and_monotone_in_edge` |
+| A-21 | **Important (practical)** | With a $2,500 trailing drawdown and several strategies, the Kelly/ruin-optimal risk per trade is often **below one ES contract**. The probe floor then overrides the staging. | Not a code fix: **trade MES (micro, $1.25/tick)** so sizes can follow the maths. Set `tick_value: 1.25` in config.json and run NT8 on MES. | smoke run sizes: $16 optimal vs $100 floor |
+| A-22 | Medium | Halt/rollback could be silently undone by the next nightly run. | `halted` and `pinned` live in config.json and are respected by `evolve`; only `resume` clears them. | `test_halt_resume_rollback_and_log_rotation` |
 
 ## 4. Known limits (read before trading real money)
 
-1. **No evidence of edge.** Synthetic data only. Run `propose` on at least
-   250 sessions of real exported bars; until the gate passes there, the
-   honest default is to not trade.
+1. **No evidence of edge.** Synthetic data only. Run `evolve` nightly on at
+   least 250 sessions of real exported bars. The system won't trade until
+   something passes both the gate and a forward paper trial, which is the
+   correct default.
 2. **Trade frequency.** About 0.5 trades per session means about one year of
    data per meaningful gate decision. A gate that rarely passes is the system
    working, not failing.
@@ -209,6 +221,25 @@ broker floor are NinjaScript properties set by the user. They are not in
 4. **Fill model divergence.** Python is deliberately pessimistic (stop-first,
    1 tick of slippage per side). Compare `trades.csv` with backtests monthly.
 5. **Commission.** NT8's `ProfitCurrency` includes commission only if a
-   commission template is configured on the account. Configure one, or the
-   Bayesian layer learns from gross P&L.
+   commission template is configured on the account. Configure one, or live
+   monitoring and sizing learn from gross P&L.
+7. **One position at a time.** Live genomes share one position (the first
+   signal in priority order wins), mirroring the backtest. D is divided by
+   the number of live genomes, which is conservative.
+8. **Search space.** The vocabulary is small on purpose (finding A-21 and the
+   DSR penalty). New condition types need a code change in both Python and
+   C#, followed by the parity test.
 6. Finding A-15 (threading) is open.
+
+---
+
+## 5. What was deliberately not built
+
+* **Self-modifying code deployed live.** The system invents strategies as
+  data inside a verified interpreter. It never writes or deploys new code. An
+  optimiser that can change its own executor can also break it, and a backtest
+  can't catch every way that happens.
+* **Learnable account limits.** Hard limits and the sizing ceiling are
+  outside the learning loop's write path, in both Python and C#.
+* **Deep RL.** See §1: sample-starved at this trade frequency, and it breaks
+  determinism.

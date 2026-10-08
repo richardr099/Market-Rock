@@ -161,6 +161,16 @@ def session_profiles(session, high, low, volume, tick, va_pct):
     return poc_b, vah_b, val_b
 
 
+@jit
+def bar_in_session(session):
+    """0 for the first bar of each session, then 1, 2, ..."""
+    m = len(session)
+    out = np.zeros(m, dtype=np.int64)
+    for i in range(1, m):
+        out[i] = 0 if session[i] != session[i - 1] else out[i - 1] + 1
+    return out
+
+
 @dataclass(frozen=True)
 class Features:
     atr: np.ndarray
@@ -171,6 +181,7 @@ class Features:
     poc: np.ndarray
     vah: np.ndarray
     val: np.ndarray
+    bar_in_session: np.ndarray
 
 
 def compute(b: Bars, tick: float, va_pct: float, vol_pct_l: int = VOL_PCT_L) -> Features:
@@ -184,4 +195,5 @@ def compute(b: Bars, tick: float, va_pct: float, vol_pct_l: int = VOL_PCT_L) -> 
         vol_pct=pct_rank(atr / b.close, vol_pct_l),
         er=efficiency_ratio(b.close, ER_N),
         poc=poc, vah=vah, val=val,
+        bar_in_session=bar_in_session(b.session),
     )

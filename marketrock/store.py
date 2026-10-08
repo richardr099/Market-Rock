@@ -1,18 +1,24 @@
-"""Files shared with NinjaTrader, plus the hash-chained promotion ledger.
+"""Files shared with NinjaTrader, plus the hash-chained ledger.
 
-live/params.json      canonical JSON (sorted keys, repr floats), read by NT8
-live/params.sha256    hex SHA-256 of the exact bytes of params.json
-live/history/<sha>.json  every version ever made live (rollback source)
-state/ledger.jsonl    append-only; entry.prev = sha256 of the previous line
-state/search.json     cumulative trial count + ES step size (DSR needs the
-                      cumulative count, so this file must never be reset)
-state/regimes.json    Bayesian regime posteriors + last processed trade time
+live/portfolio.txt     canonical text (fixed line order), read by NT8
+live/portfolio.sha256  hex SHA-256 of the exact bytes of portfolio.txt
+live/history/<sha>.txt every version ever made live (rollback source)
+state/ledger.jsonl     append-only; entry.prev = sha256 of the previous line
+state/portfolio.json   lifecycle state of every genome ever proposed
+state/search.json      cumulative trial count (the DSR needs it: never reset)
+state/config.json      YOUR settings (risk ceiling, limits, slots, halt)
 
-NT8 verifies params.sha256 before every load and refuses to trade on a
-mismatch, so a partially written or hand-edited file fails closed.
-Writes go to a temp file then os.replace() (atomic on NTFS and POSIX);
-params.json is replaced before params.sha256 so a reader racing the write sees
-a hash mismatch (refuse) rather than a matching stale pair.
+portfolio.txt format:
+  version=2
+  va_pct=0.7
+  n=<k>
+  g<i>.id=<12 hex>          (must equal sha256(rule)[:12])
+  g<i>.risk_usd=<float>
+  g<i>.rule=<canonical genome text>
+
+NT8 verifies the hash, the ids and every bound before loading and refuses
+on any mismatch. Writes are temp-file + os.replace(); the text is replaced
+before the hash, so a racing reader sees a mismatch, never a stale pair.
 """
 from __future__ import annotations
 
@@ -20,17 +26,47 @@ import hashlib
 import json
 import os
 from pathlib import Path
-from typing import Dict, List, Mapping, Optional
+from typing import List, Mapping, Optional, Sequence, Tuple
 
-from . import params as P
+from . import genome as G
+from .strategy import VA_PCT
 
 GENESIS = "0" * 64
+MAX_GENOMES = 8
+MAX_RISK_FILE = 5000.0
+
+Entry = Tuple[str, G.Genome, float]
 
 
-def canonical(p: Mapping[str, float]) -> bytes:
-    v = P.validate(p)
-    body = ",\n".join(f'  "{k}": {repr(float(v[k]))}' for k in sorted(v))
-    return ("{\n" + body + "\n}\n").encode("ascii")
+def canonical(entries: Sequence[Entry]) -> bytes:
+    if len(entries) > MAX_GENOMES:
+        raise ValueError(f"at most {MAX_GENOMES} live genomes")
+    lines = ["version=2", f"va_pct={VA_PCT!r}", f"n={len(entries)}"]
+    for i, (gid, g, risk) in enumerate(entries):
+        G.validate(g)
+        if gid != g.id:
+            raise ValueError("genome id mismatch")
+        risk = float(risk)
+        if not 0.0 <= risk <= MAX_RISK_FILE:
+            raise ValueError("risk out of range")
+        lines += [f"g{i}.id={gid}", f"g{i}.risk_usd={risk!r}", f"g{i}.rule={g.text()}"]
+    return ("\n".join(lines) + "\n").encode("ascii")
+
+
+def parse(data: bytes) -> List[Entry]:
+    kv = {}
+    for line in data.decode("ascii").splitlines():
+        k, v = line.split("=", 1)
+        kv[k] = v
+    if kv.get("version") != "2" or float(kv["va_pct"]) != VA_PCT:
+        raise ValueError("unsupported portfolio file")
+    out = []
+    for i in range(int(kv["n"])):
+        g = G.parse(kv[f"g{i}.rule"])
+        out.append((kv[f"g{i}.id"], g, float(kv[f"g{i}.risk_usd"])))
+    if canonical(out) != data:
+        raise ValueError("non-canonical portfolio file")
+    return out
 
 
 def sha256(b: bytes) -> str:
@@ -47,29 +83,29 @@ def _atomic_write(path: Path, data: bytes) -> None:
     os.replace(tmp, path)
 
 
-def write_live(live_dir: Path, p: Mapping[str, float]) -> str:
-    data = canonical(p)
+def write_live(live_dir: Path, entries: Sequence[Entry]) -> str:
+    data = canonical(entries)
     h = sha256(data)
-    _atomic_write(live_dir / "history" / f"{h}.json", data)
-    _atomic_write(live_dir / "params.json", data)
-    _atomic_write(live_dir / "params.sha256", (h + "\n").encode())
+    _atomic_write(live_dir / "history" / f"{h}.txt", data)
+    _atomic_write(live_dir / "portfolio.txt", data)
+    _atomic_write(live_dir / "portfolio.sha256", (h + "\n").encode())
     return h
 
 
-def read_live(live_dir: Path) -> tuple[Dict[str, float], str]:
-    data = (live_dir / "params.json").read_bytes()
-    want = (live_dir / "params.sha256").read_text().strip()
+def read_live(live_dir: Path) -> Tuple[List[Entry], str]:
+    data = (live_dir / "portfolio.txt").read_bytes()
+    want = (live_dir / "portfolio.sha256").read_text().strip()
     got = sha256(data)
     if got != want:
-        raise ValueError(f"live params hash mismatch: file={got} recorded={want}")
-    return P.validate(json.loads(data)), got
+        raise ValueError(f"live portfolio hash mismatch: file={got} recorded={want}")
+    return parse(data), got
 
 
-def read_history(live_dir: Path, h: str) -> Dict[str, float]:
-    data = (live_dir / "history" / f"{h}.json").read_bytes()
+def read_history(live_dir: Path, h: str) -> List[Entry]:
+    data = (live_dir / "history" / f"{h}.txt").read_bytes()
     if sha256(data) != h:
         raise ValueError("history file corrupted")
-    return P.validate(json.loads(data))
+    return parse(data)
 
 
 # --------------------------- ledger ---------------------------------------

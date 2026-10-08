@@ -48,7 +48,7 @@ static class Driver
         Action<string, object[]> call = (m, a) => typeof(MarketRockStrategy).GetMethod(m, flags).Invoke(st, a);
         st.State = State.SetDefaults; call("OnStateChange", new object[0]);
         st.DataDir = args[1]; st.ExportHistory = true;
-        st.DailyLossLimitUsd = 1e12; st.TrailingDrawdownUsd = 1e12; st.AccountStartBalance = 1e12; st.ConsistencyBaseUsd = 1e12;
+        st.MaxRiskPerTradeUsd = 5000; st.DailyLossLimitUsd = 1e12; st.TrailingDrawdownUsd = 1e12; st.AccountStartBalance = 1e12; st.ConsistencyBaseUsd = 1e12;
         st.TickSize = 0.25; st.Instrument = new Instrument(); st.Instrument.MasterInstrument.PointValue = 50;
         st.Position = new Position(); st.PositionAccount = new Position(); st.Account = new Account();
         st.SystemPerformance = new SystemPerformanceT();
@@ -62,19 +62,20 @@ static class Driver
         st.State = State.DataLoaded; call("OnStateChange", new object[0]);
         st.State = State.Historical;
 
-        var outw = new StreamWriter(args[2]); outw.WriteLine("bar_time,direction,qty,stop_ticks,target_ticks");
+        var outw = new StreamWriter(args[2]); outw.WriteLine("bar_time,genome,direction,qty,stop_ticks,target_ticks");
         long lastBarClosed = 0; double stop = 0, tgt = 0;
         Strategy.OnSetStop = (n, v) => stop = v;
         Strategy.OnSetTarget = (n, v) => tgt = v;
         Strategy.OnEnter = (n, q) =>
         {
-            outw.WriteLine(string.Format(inv, "{0},{1},{2},{3},{4}", lastBarClosed, n == "MR_L" ? 1 : -1, q, stop, tgt));
+            string gid = (string)typeof(MarketRockStrategy).GetField("entryGenId", flags).GetValue(st);
+            outw.WriteLine(string.Format(inv, "{0},{1},{2},{3},{4},{5}", lastBarClosed, gid, n == "MR_L" ? 1 : -1, q, stop, tgt));
             // no fills in this harness: report the entry as cancelled so the strategy stays flat
             call("OnOrderUpdate", new object[] { new Order { Name = n }, 0.0, 0.0, q, 0, 0.0, OrderState.Cancelled, DateTime.MinValue, ErrorCode.NoError, "" });
         };
 
-        var featw = new StreamWriter(args[2] + ".features.csv"); featw.WriteLine("atr,delta_z,vol_pct,er,poc,vah,val");
-        Func<string, double> fld = nm => (double)typeof(MarketRockStrategy).GetField(nm, flags).GetValue(st);
+        var featw = new StreamWriter(args[2] + ".features.csv"); featw.WriteLine("atr,delta_z,vol_pct,er,poc,vah,val,bar_in_session");
+        Func<string, double> fld = nm => Convert.ToDouble(typeof(MarketRockStrategy).GetField(nm, flags).GetValue(st), inv);
         Func<double, string> fmt = x => x.ToString("R", inv);
         int lastCount = 0;
         int bi = 0;
@@ -98,7 +99,7 @@ static class Driver
             {
                 lastCount = done;
                 featw.WriteLine(string.Join(",", new[] { fmt(fld("atr")), fmt(fld("fDz")), fmt(fld("fVolPct")), fmt(fld("fEr")),
-                    fmt(fld("sessPoc")), fmt(fld("sessVah")), fmt(fld("sessVal")) }));
+                    fmt(fld("sessPoc")), fmt(fld("sessVah")), fmt(fld("sessVal")), fmt(fld("barInSession")) }));
             }
         }
         featw.Flush(); featw.Dispose();

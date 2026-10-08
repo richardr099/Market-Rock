@@ -1,12 +1,14 @@
-"""marketrock CLI.
+"""marketrock CLI (v2: self-developing portfolio).
 
-  init      write default params as the first live version (human, named)
-  backtest  run the current or a given parameter file over a bar CSV
-  propose   nightly job: learn from live fills + search; auto-apply DE-RISK
-            changes only; write a candidate for a human to promote
-  promote   human approval of a gated candidate -> live
-  rollback  human: restore any earlier live version by hash
-  verify    check the ledger chain and the live params hash
+  init      create state/config.json (YOUR settings) and an empty live portfolio
+  evolve    nightly, unattended: learn from live fills, retire what fails,
+            promote what wins its paper trial, invent + tune strategies,
+            size everything, write the live portfolio and a daily report
+  backtest  run the current live portfolio (or a portfolio file) over bars
+  halt      kill switch: empty live portfolio until `resume`
+  resume    clear halt / pin
+  rollback  restore an earlier live portfolio by hash and pin it
+  verify    check the ledger chain and the live file hash
 """
 from __future__ import annotations
 
@@ -15,29 +17,39 @@ import csv
 import json
 import sys
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import List
 
 import numpy as np
 
-from . import autonomy, optimizer as O, params as P, store
+from . import evolve as E, genome as G, portfolio as PF, report, store
 from .data import load_csv
-from .strategy import Costs, Limits, run
+from .features import compute
+from .strategy import VA_PCT, Costs, Limits, run
 from .validation import sharpe
 
-TRADE_COLUMNS = ("exit_time", "session", "regime", "direction", "qty", "pnl_usd", "params_sha256")
+TRADE_COLUMNS = ("exit_time", "session", "genome", "direction", "qty", "pnl_usd", "risk_usd", "portfolio_sha256")
+MAX_CANDIDATES_PER_NIGHT = 5
+MAX_OVERLAP = 0.5  # Jaccard overlap of entry bars; above this a candidate is a clone
 
 
 def _now() -> int:
     return int(time.time())  # metadata only; never feeds a computation
 
 
-def _costs(a) -> Costs:
-    return Costs(a.tick, a.tick_value, a.commission, a.slippage)
+def _cfg(state: Path) -> dict:
+    cfg = dict(PF.DEFAULT_CONFIG)
+    cfg.update(store.read_json(state / "config.json", {}))
+    return cfg
 
 
-def _limits(a) -> Limits:
-    return Limits(a.daily_loss, a.trailing_dd)
+def _costs(cfg) -> Costs:
+    return Costs(cfg["tick"], cfg["tick_value"], cfg["commission_rt"], cfg["slip_ticks"])
+
+
+def _limits(cfg) -> Limits:
+    return Limits(cfg["daily_loss_usd"], cfg["trailing_dd_usd"])
 
 
 def _read_trades(path: Path) -> List[dict]:
@@ -48,150 +60,203 @@ def _read_trades(path: Path) -> List[dict]:
         return list(r)
 
 
+def _jaccard(a: np.ndarray, b: np.ndarray) -> float:
+    u = np.count_nonzero(a | b)
+    return np.count_nonzero(a & b) / u if u else 0.0
+
+
+def _publish(live: Path, state: Path, entries, event: str, approver: str, extra=None) -> str:
+    data = store.canonical(entries)
+    try:
+        _, cur = store.read_live(live)
+    except FileNotFoundError:
+        cur = None
+    if cur == store.sha256(data):
+        return cur
+    h = store.write_live(live, entries)
+    rec = {"event": event, "from": cur, "portfolio_sha256": h, "approver": approver, "t": _now()}
+    rec.update(extra or {})
+    store.ledger_append(state, rec)
+    return h
+
+
 def cmd_init(a) -> int:
     live, state = Path(a.live_dir), Path(a.state_dir)
-    if (live / "params.json").exists():
-        print("refusing: live params already exist (use promote/rollback)", file=sys.stderr)
+    if (live / "portfolio.txt").exists():
+        print("refusing: live portfolio already exists", file=sys.stderr)
         return 2
-    h = store.write_live(live, P.defaults())
-    store.ledger_append(state, {"event": "init", "params_sha256": h, "approver": a.approver, "t": _now()})
-    print(h)
+    if not (state / "config.json").exists():
+        store.write_json(state / "config.json", PF.DEFAULT_CONFIG)
+    _publish(live, state, [], "init", a.approver)
+    print(f"initialised. Edit {state / 'config.json'} (max_risk_per_trade_usd is your sizing ceiling).")
+    return 0
+
+
+def cmd_evolve(a) -> int:
+    live, state, rep_dir = Path(a.live_dir), Path(a.state_dir), Path(a.report_dir)
+    cfg = _cfg(state)
+    costs, limits = _costs(cfg), _limits(cfg)
+    bars_bytes = Path(a.bars).read_bytes()
+    b = load_csv(a.bars)
+    f = compute(b, costs.tick, VA_PCT)
+    pf = store.read_json(state / "portfolio.json", {"members": {}, "trades_meta": {"processed": 0, "head": None}})
+    members = pf["members"]
+    now = _now()
+    events: List[dict] = []
+    warnings: List[str] = []
+    info = {"sessions": int(len(np.unique(b.session))), "last_session": int(b.session[-1])}
+
+    # 1. learn from live fills
+    if a.trades and Path(a.trades).exists():
+        rows = _read_trades(Path(a.trades))
+        head = store.sha256(json.dumps(rows[:1], sort_keys=True).encode())
+        meta = pf["trades_meta"]
+        if (meta["head"] not in (None, head) and rows) or len(rows) < meta["processed"]:
+            print("refusing: trade log was rotated/rewritten since last run", file=sys.stderr)
+            return 2
+        PF.ingest_trades(members, rows[meta["processed"]:])
+        pf["trades_meta"] = {"processed": len(rows), "head": head if rows else meta["head"]}
+
+    # 2. retire live strategies that are failing (and roll back failed tunes)
+    PF.monitor_live(members, now, events)
+    # 3. paper trials on forward data
+    PF.review_paper(members, b, f, costs, limits, cfg, now, events)
+
+    # 4. research: invent + tune, gate, admit to paper
+    sessions = np.unique(b.session)
+    st = store.read_json(state / "search.json", {"n_trials": 0})
+    H = int(cfg["holdout_sessions"])
+    passed = 0
+    if len(sessions) < H + 3 * E.K_FOLDS:
+        warnings.append(f"Only {len(sessions)} sessions of data; research needs >= {H + 3 * E.K_FOLDS}. Export more history.")
+        info["evaluated"] = 0
+    else:
+        hold = sessions[-H:]
+        cut = int(np.searchsorted(b.session, hold[0]))
+        srch = E.Search(b.slice(0, cut), E.slice_features(f, 0, cut), costs, limits)
+        rng = np.random.default_rng(E.seed_for(bars_bytes, st["n_trials"]))
+        active = [G.parse(m["rule"]) for m in members.values() if m["status"] in ("LIVE", "PAPER")]
+        ranked = srch.evolve(G.seeds() + active, rng)
+        tunes = []
+        for mid, m in sorted(members.items()):
+            if m["status"] == "LIVE":
+                kids = srch.tune(G.parse(m["rule"]), int(cfg["tune_children"]), rng)
+                if kids and np.isfinite(kids[0].fitness):
+                    tunes.append((kids[0], mid))
+        n_trials = st["n_trials"] + srch.trials
+        st["n_trials"] = n_trials
+        var_sr = E.var_sr_of(list(srch.cache.values()))
+        cands = [(e, None) for e in ranked if e.genome.id not in members and np.isfinite(e.fitness)][:MAX_CANDIDATES_PER_NIGHT]
+        cands += [(e, p) for e, p in tunes if e.genome.id not in members]
+        n_paper = sum(1 for m in members.values() if m["status"] == "PAPER")
+        close_s = b.close[:cut]
+        warm = G.warm_mask(close_s, srch.f)
+        masks = {mid: G.signal(G.parse(m["rule"]), close_s, srch.f, warm) != 0
+                 for mid, m in members.items() if m["status"] in ("LIVE", "PAPER")}
+        for e, parent in cands:
+            if n_paper >= cfg["max_paper"]:
+                break
+            mk = G.signal(e.genome, close_s, srch.f, warm) != 0
+            if any(_jaccard(mk, other) > MAX_OVERLAP for mid, other in masks.items() if mid != parent):
+                continue  # a clone of something already live/paper adds no diversification
+            eh = E.evaluate_holdout(b, e.genome, f, hold, costs, limits)
+            checks = E.gate(e, eh, n_trials, var_sr, limits)
+            if all(c["pass"] for c in checks.values()):
+                why = ("tuned from " + parent if parent else "new strategy") + f"; passed gate (DSR {checks['deflated_sharpe']['value']:.3f})"
+                masks[e.genome.id] = mk
+                members[e.genome.id] = PF.new_member(e.genome, int(b.time[-1]), int(b.session[-1]), e.r, e.fitness, parent, now, why)
+                events.append({"id": e.genome.id, "event": "PAPER", "why": why, "rule": e.genome.describe()})
+                n_paper += 1
+                passed += 1
+        info["evaluated"] = srch.trials
+    info["n_trials"] = st["n_trials"]
+    info["passed"] = passed
+
+    # 5. size, publish
+    PF.size(members, cfg)
+    entries = PF.live_genomes(members, cfg)[: store.MAX_GENOMES]
+    if cfg.get("pinned"):
+        warnings.append(f"Live portfolio is pinned to {cfg['pinned'][:12]} by a rollback; run `marketrock resume` to let the system manage it again.")
+    else:
+        _publish(live, state, entries, "auto", "auto:evolve", {"events": [{k: e[k] for k in ("id", "event", "why")} for e in events]})
+    if cfg.get("halted"):
+        warnings.append("Trading is halted.")
+
+    store.write_json(state / "portfolio.json", pf)
+    store.write_json(state / "search.json", st)
+    date = datetime.fromtimestamp(now, timezone.utc).strftime("%Y-%m-%d")
+    rep_dir.mkdir(parents=True, exist_ok=True)
+    path = rep_dir / f"{date}.md"
+    path.write_text(report.render(date, members, events, cfg, dict(info, warnings=warnings)))
+    print(json.dumps({"report": str(path), "events": [(e["event"], e["id"]) for e in events],
+                      "live": [e[0] for e in entries], "passed_gate": passed}, indent=1))
     return 0
 
 
 def cmd_backtest(a) -> int:
+    state = Path(a.state_dir)
+    cfg = _cfg(state)
     b = load_csv(a.bars)
-    p = P.validate(json.loads(Path(a.params).read_text())) if a.params else store.read_live(Path(a.live_dir))[0]
-    r = run(b, p, _costs(a), _limits(a))
+    entries = store.parse(Path(a.portfolio).read_bytes()) if a.portfolio else store.read_live(Path(a.live_dir))[0]
+    r = run(b, [g for _, g, _ in entries], [x for _, _, x in entries], _costs(cfg), _limits(cfg))
     daily = r.daily_pnl(np.unique(b.session))
-    print(json.dumps({
-        "trades": r.n, "net_usd": round(float(r.pnl.sum()), 2), "blown": r.blown,
-        "win_rate": round(float((r.pnl > 0).mean()), 4) if r.n else None,
-        "sharpe_per_session": round(sharpe(daily), 4),
-        "max_drawdown_usd": round(O.max_drawdown(daily), 2),
-    }, indent=1))
+    print(json.dumps({"genomes": len(entries), "trades": r.n, "net_usd": round(float(r.pnl.sum()), 2),
+                      "blown": r.blown, "sharpe_per_session": round(sharpe(daily), 4),
+                      "max_drawdown_usd": round(E.max_drawdown(daily), 2)}, indent=1))
     return 0
 
 
-def cmd_propose(a) -> int:
-    live, state, out = Path(a.live_dir), Path(a.state_dir), Path(a.out_dir)
-    costs, limits = _costs(a), _limits(a)
-    inc, inc_hash = store.read_live(live)
-    bars_bytes = Path(a.bars).read_bytes()
-    b = load_csv(a.bars)
-    sessions = np.unique(b.session)
-    if len(sessions) < a.holdout_sessions + 3 * O.K_FOLDS:
-        print(f"refusing: need >= {a.holdout_sessions + 3 * O.K_FOLDS} sessions, have {len(sessions)}", file=sys.stderr)
-        return 2
-    report: dict = {"base_params_sha256": inc_hash, "bars_sha256": store.sha256(bars_bytes), "t": _now()}
-
-    # ---- 1. Bayesian regime layer from live fills (autonomous, de-risk only)
-    regimes = O.states_from_json(store.read_text_opt(state / "regimes.json") or "{}")
-    rmeta = store.read_json(state / "regimes_meta.json", {"processed": 0, "head_sha256": None})
-    derisk_applied = {}
-    if a.trades:
-        rows = _read_trades(Path(a.trades))
-        head = store.sha256(json.dumps(rows[:1], sort_keys=True).encode())
-        if rmeta["head_sha256"] not in (None, head) or len(rows) < rmeta["processed"]:
-            print("refusing: trade log was rotated/rewritten since last run; human review required", file=sys.stderr)
-            return 2
-        new = rows[rmeta["processed"]:]
-        for reg in O.REGIME_KEYS:
-            regimes[reg] = O.update_regime(regimes.get(reg, O.RegimeState()),
-                                           [t for t in new if int(t["regime"]) == reg])
-        bayes, breport = O.bayes_proposal(inc, regimes)
-        report["regime_posteriors"] = breport
-        if not a.no_auto_derisk:
-            derisked = autonomy.apply_derisk(inc, bayes)
-            if derisked != inc:
-                derisk_applied, _ = autonomy.split_changes(inc, derisked)
-                h = store.write_live(live, derisked)
-                store.ledger_append(state, {"event": "auto_derisk", "from": inc_hash, "params_sha256": h,
-                                            "changes": derisk_applied, "approver": "auto:derisk", "t": _now()})
-                inc, inc_hash = derisked, h
-        store.write_json(state / "regimes_meta.json", {"processed": len(rows), "head_sha256": head})
-        store._atomic_write(state / "regimes.json", O.states_to_json(regimes).encode())
-        # Regime re-enables / size increases go to the human candidate below.
-        report["regime_increase_suggestions"] = autonomy.split_changes(inc, bayes)[1]
-    report["auto_derisk_applied"] = derisk_applied
-
-    # ---- 2. Evolutionary search on the search slice (never sees hold-out)
-    hold = sessions[-a.holdout_sessions:]
-    n_search_bars = int(np.searchsorted(b.session, hold[0]))
-    b_search = b.slice(0, n_search_bars)
-    st = store.read_json(state / "search.json", {"n_trials": 0, "sigma": O.SIGMA_INIT})
-    seed = O.seed_for(bars_bytes, inc_hash, st["n_trials"])
-    inc_eval, best, evals, new_sigma, var_sr = O.search(b_search, inc, st["sigma"], seed, costs, limits)
-    n_trials = st["n_trials"] + len(evals) + 1
-    store.write_json(state / "search.json", {"n_trials": n_trials, "sigma": new_sigma})
-
-    # ---- 3. Gate on hold-out
-    cand_hold = O.evaluate_holdout(b, best.params, hold, costs, limits)
-    inc_hold = O.evaluate_holdout(b, inc, hold, costs, limits)
-    checks = O.gate(best, cand_hold, inc_hold, n_trials, var_sr, limits)
-    passed = all(c["pass"] for c in checks.values()) and best.params != inc
-    report.update({
-        "status": "AWAITING_APPROVAL" if passed else "REJECTED",
-        "gates": checks, "seed": seed, "n_trials_cumulative": n_trials, "sigma_next": new_sigma,
-        "incumbent_fitness": inc_eval.fitness if np.isfinite(inc_eval.fitness) else str(inc_eval.fitness),
-        "candidate_fitness": best.fitness if np.isfinite(best.fitness) else str(best.fitness),
-        "changes": autonomy.split_changes(inc, best.params)[1],
-    })
-    out.mkdir(parents=True, exist_ok=True)
-    (out / "candidate.json").write_bytes(store.canonical(best.params))
-    store.write_json(out / "report.json", report)
-    store.ledger_append(state, {"event": "proposal", "status": report["status"], "base": inc_hash,
-                                "candidate_sha256": store.sha256(store.canonical(best.params)),
-                                "n_trials": n_trials, "t": _now()})
-    print(json.dumps({"status": report["status"], "auto_derisk_applied": derisk_applied,
-                      "failed_gates": [k for k, v in checks.items() if not v["pass"]]}, indent=1))
-    return 0
-
-
-def cmd_promote(a) -> int:
-    live, state, out = Path(a.live_dir), Path(a.state_dir), Path(a.out_dir)
+def _need_name(a) -> bool:
     if not a.approver.strip():
         print("refusing: --approver must name a person", file=sys.stderr)
+        return False
+    return True
+
+
+def cmd_halt(a) -> int:
+    if not _need_name(a):
         return 2
-    report = json.loads((out / "report.json").read_text())
-    cand_bytes = (out / "candidate.json").read_bytes()
-    cand = P.validate(json.loads(cand_bytes))
-    _, live_hash = store.read_live(live)
-    if report.get("status") != "AWAITING_APPROVAL":
-        print(f"refusing: candidate status is {report.get('status')}", file=sys.stderr)
+    state = Path(a.state_dir)
+    cfg = store.read_json(state / "config.json", dict(PF.DEFAULT_CONFIG))
+    cfg["halted"] = True
+    store.write_json(state / "config.json", cfg)
+    _publish(Path(a.live_dir), state, [], "halt", a.approver)
+    print("halted: live portfolio is empty; NT8 stops opening trades at its next parameter check")
+    return 0
+
+
+def cmd_resume(a) -> int:
+    if not _need_name(a):
         return 2
-    if report.get("base_params_sha256") != live_hash:
-        # Live params changed after this candidate was evaluated (e.g. an
-        # auto-derisk ran). Promoting would silently undo that change.
-        print("refusing: candidate was built on a different live version; re-run propose", file=sys.stderr)
-        return 2
-    h = store.write_live(live, cand)
-    store.ledger_append(state, {"event": "promote", "from": live_hash, "params_sha256": h,
-                                "approver": a.approver, "report_sha256": store.sha256((out / "report.json").read_bytes()),
-                                "t": _now()})
-    print(h)
+    state = Path(a.state_dir)
+    cfg = store.read_json(state / "config.json", dict(PF.DEFAULT_CONFIG))
+    cfg["halted"] = False
+    cfg.pop("pinned", None)
+    store.write_json(state / "config.json", cfg)
+    store.ledger_append(state, {"event": "resume", "approver": a.approver, "t": _now()})
+    print("resumed: the next `evolve` run manages the live portfolio again")
     return 0
 
 
 def cmd_rollback(a) -> int:
-    live, state = Path(a.live_dir), Path(a.state_dir)
-    if not a.approver.strip():
-        print("refusing: --approver must name a person", file=sys.stderr)
+    if not _need_name(a):
         return 2
-    p = store.read_history(live, a.to)
-    _, cur = store.read_live(live)
-    h = store.write_live(live, p)
-    store.ledger_append(state, {"event": "rollback", "from": cur, "params_sha256": h, "approver": a.approver, "t": _now()})
-    print(h)
+    live, state = Path(a.live_dir), Path(a.state_dir)
+    entries = store.read_history(live, a.to)
+    cfg = store.read_json(state / "config.json", dict(PF.DEFAULT_CONFIG))
+    cfg["pinned"] = a.to
+    store.write_json(state / "config.json", cfg)
+    _publish(live, state, entries, "rollback", a.approver)
+    print(f"rolled back and pinned to {a.to[:12]}; `marketrock resume` to unpin")
     return 0
 
 
 def cmd_verify(a) -> int:
     recs = store.ledger_verify(Path(a.state_dir))
     _, h = store.read_live(Path(a.live_dir))
-    last = next((r["params_sha256"] for r in reversed(recs) if "params_sha256" in r), None)
+    last = next((r["portfolio_sha256"] for r in reversed(recs) if "portfolio_sha256" in r), None)
     if last != h:
-        print(f"FAIL: live params {h} not the last ledgered version {last}", file=sys.stderr)
+        print(f"FAIL: live portfolio {h} is not the last ledgered version {last}", file=sys.stderr)
         return 1
     print(f"OK: {len(recs)} ledger entries, live={h}")
     return 0
@@ -201,22 +266,15 @@ def main(argv=None) -> int:
     ap = argparse.ArgumentParser(prog="marketrock")
     ap.add_argument("--live-dir", default="live")
     ap.add_argument("--state-dir", default="state")
-    ap.add_argument("--out-dir", default="proposals")
-    ap.add_argument("--tick", type=float, default=0.25)
-    ap.add_argument("--tick-value", type=float, default=12.5)
-    ap.add_argument("--commission", type=float, default=4.5, help="USD per contract round trip")
-    ap.add_argument("--slippage", type=float, default=1.0, help="ticks per side")
-    ap.add_argument("--daily-loss", type=float, default=1000.0)
-    ap.add_argument("--trailing-dd", type=float, default=2500.0)
+    ap.add_argument("--report-dir", default="reports")
     sub = ap.add_subparsers(dest="cmd", required=True)
     s = sub.add_parser("init"); s.add_argument("--approver", required=True); s.set_defaults(fn=cmd_init)
-    s = sub.add_parser("backtest"); s.add_argument("--bars", required=True); s.add_argument("--params")
+    s = sub.add_parser("evolve"); s.add_argument("--bars", required=True); s.add_argument("--trades")
+    s.set_defaults(fn=cmd_evolve)
+    s = sub.add_parser("backtest"); s.add_argument("--bars", required=True); s.add_argument("--portfolio")
     s.set_defaults(fn=cmd_backtest)
-    s = sub.add_parser("propose"); s.add_argument("--bars", required=True); s.add_argument("--trades")
-    s.add_argument("--holdout-sessions", type=int, default=20)
-    s.add_argument("--no-auto-derisk", action="store_true")
-    s.set_defaults(fn=cmd_propose)
-    s = sub.add_parser("promote"); s.add_argument("--approver", required=True); s.set_defaults(fn=cmd_promote)
+    for name, fn in (("halt", cmd_halt), ("resume", cmd_resume)):
+        s = sub.add_parser(name); s.add_argument("--approver", required=True); s.set_defaults(fn=fn)
     s = sub.add_parser("rollback"); s.add_argument("--to", required=True); s.add_argument("--approver", required=True)
     s.set_defaults(fn=cmd_rollback)
     s = sub.add_parser("verify"); s.set_defaults(fn=cmd_verify)

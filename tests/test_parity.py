@@ -1,12 +1,12 @@
 """Python <-> C# parity.
 
-1. Static: constants and the parameter bounds table in MarketRockStrategy.cs
-   equal those in features.py / params.py.
+1. Static: feature constants and the genome vocabulary/bounds in
+   MarketRockStrategy.cs equal those in features.py / genome.py / store.py.
 2. Dynamic (needs the .NET SDK; skipped otherwise): synthetic ticks are
    replayed through the REAL MarketRockStrategy.cs (against tools/ stubs, in
    NT8's primary-before-secondary event order). Its exported bars (incl.
-   tick-rule buy/sell volume) and every entry decision must equal the Python
-   model's exactly.
+   tick-rule buy/sell volume), all features, and every entry decision of a
+   multi-genome portfolio must equal the Python model's exactly.
 """
 import os
 import re
@@ -17,10 +17,10 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from marketrock import features as F, params as P, store
+from marketrock import features as F, genome as G, store
 from marketrock.data import Bars, load_csv
 from marketrock.features import compute
-from marketrock.strategy import regimes, signals
+from marketrock.strategy import VA_PCT, combine
 
 ROOT = Path(__file__).resolve().parents[1]
 CS = (ROOT / "ninjatrader" / "MarketRockStrategy.cs").read_text()
@@ -32,12 +32,24 @@ def test_constants_match():
         assert m and int(m.group(1)) == py, name
 
 
-def test_param_bounds_match():
-    rows = re.findall(r'new object\[\] \{ "([a-z_]+)", ([0-9.]+), ([0-9.]+) \}', CS)
-    assert [r[0] for r in rows] == list(P.NAMES)
-    for name, lo, hi in rows:
-        s = P.SPEC_BY_NAME[name]
-        assert (float(lo), float(hi)) == (s.lo, s.hi), name
+def _cs_list(name):
+    m = re.search(rf"{name} = \{{ ([^}}]*) \}};", CS)
+    return [x.strip().strip('"') for x in m.group(1).split(",")]
+
+
+def test_genome_vocabulary_and_bounds_match():
+    assert _cs_list("OpNames") == list(G.OPS)
+    assert _cs_list("LevelNames") == list(G.LEVELS)
+    assert _cs_list("FeatNames") == list(G.FEATS)
+    assert [float(x) for x in _cs_list("FeatMin")] == [G.FEAT_RANGE[f][0] for f in G.FEATS]
+    assert [float(x) for x in _cs_list("FeatMax")] == [G.FEAT_RANGE[f][1] for f in G.FEATS]
+    num = lambda n: float(re.search(rf"\b{n} = ([-0-9.]+)[,;]", CS).group(1))
+    assert (num("StopMin"), num("StopMax")) == G.STOP_RANGE
+    assert (num("RrMin"), num("RrMax")) == G.RR_RANGE
+    assert (num("HoldMin"), num("HoldMax")) == G.HOLD_RANGE
+    assert num("MaxConds") == G.MAX_CONDS and num("TimeMax") == G.TIME_MAX
+    assert num("MaxGenomes") == store.MAX_GENOMES and num("MaxRiskFile") == store.MAX_RISK_FILE
+    assert num("VaPct") == VA_PCT
 
 
 def _dotnet():
@@ -81,9 +93,15 @@ def _py_bars(t, px, v, s):
 
 @pytest.mark.skipif(_dotnet() is None, reason=".NET SDK not installed")
 def test_csharp_replay_matches_python(tmp_path):
-    p = P.validate(dict(P.defaults(), delta_z_entry=0.8, regime_vol_lo=0.0, regime_vol_hi=1.0,
-                        risk_per_trade_usd=500.0, max_contracts=10.0))
-    store.write_live(tmp_path, p)
+    mc = G.make_condition
+    genomes = [
+        G.make(1, [mc("ABOVE", "POC"), mc("GE", "delta_z", 0.8), mc("TIME_IN", "", 20, 150)], 1.1, 1.3, 25),
+        G.make(-1, [mc("BELOW", "VAL"), mc("LE", "er", 0.3)], 1.6, 2.0, 40),
+        G.make(1, [mc("CROSS_UP", "VAH"), mc("GE", "vol_pct", 0.2)], 0.9, 1.5, 30),
+        G.seeds()[1],
+        G.make(-1, [mc("CROSS_DOWN", "POC"), mc("LE", "vol_pct", 0.9), mc("LE", "delta_z", -0.3)], 2.0, 1.0, 60),
+    ]
+    store.write_live(tmp_path, [(g.id, g, 500.0) for g in genomes])
     t, px, v, s = _ticks()
     with open(tmp_path / "ticks.csv", "w") as f:
         f.write("time,price,volume,session\n")
@@ -104,23 +122,26 @@ def test_csharp_replay_matches_python(tmp_path):
     for c in ("time", "session", "open", "high", "low", "close", "volume", "buy_volume", "sell_volume"):
         np.testing.assert_allclose(getattr(csb, c), getattr(pyb, c)[:n], rtol=0, atol=1e-9, err_msg=c)
 
-    f = compute(pyb, 0.25, p["va_pct"])
+    f = compute(pyb, 0.25, VA_PCT)
     feat = np.genfromtxt(str(entries_csv) + ".features.csv", delimiter=",", names=True)
     assert len(feat) == n
-    for c in ("atr", "delta_z", "vol_pct", "er", "poc", "vah", "val"):
+    for c in ("atr", "delta_z", "vol_pct", "er", "poc", "vah", "val", "bar_in_session"):
         np.testing.assert_allclose(feat[c], getattr(f, c)[:n], rtol=1e-9, atol=1e-9, equal_nan=True, err_msg=c)
-    reg = regimes(f.vol_pct, f.er, f.atr, f.vah, f.val, p["regime_vol_lo"], p["regime_vol_hi"], p["er_trend"])
-    sig = signals(pyb.close, f.delta_z, f.vah, f.val, reg, p["delta_z_entry"], True, True)
+    sig_dir, sig_g = combine(genomes, pyb.close, f)
     exp = []
     for j in range(n):
         last_of_session = j == len(pyb) - 1 or pyb.session[j + 1] != pyb.session[j]
-        if sig[j] == 0 or last_of_session:
+        if sig_dir[j] == 0 or last_of_session:
             continue
-        mult = p["size_mult_rotational"] if reg[j] == 1 else p["size_mult_trend"]
-        st = max(1, int(np.floor(p["stop_atr"] * f.atr[j] / 0.25 + 0.5)))
-        q = min(int(np.floor(p["risk_per_trade_usd"] * mult / (st * 12.5))), int(p["max_contracts"]))
+        g = genomes[sig_g[j]]
+        st = max(1, int(np.floor(g.stop_atr * f.atr[j] / 0.25 + 0.5)))
+        q = int(np.floor(500.0 / (st * 12.5)))
         if q >= 1:
-            exp.append((int(pyb.time[j]), int(sig[j]), q, st, max(1, int(np.floor(st * p["target_rr"] + 0.5)))))
-    got = [tuple(int(float(x)) for x in line.split(",")) for line in entries_csv.read_text().splitlines()[1:]]
-    assert len(exp) >= 5, "fixture produced too few signals to be a meaningful parity test"
+            exp.append((int(pyb.time[j]), g.id, int(sig_dir[j]), q, st, max(1, int(np.floor(st * g.target_rr + 0.5)))))
+    got = []
+    for line in entries_csv.read_text().splitlines()[1:]:
+        t, gid, d, q, st, tt = line.split(",")
+        got.append((int(t), gid, int(d), int(q), int(float(st)), int(float(tt))))
+    assert len(exp) >= 30, "fixture produced too few signals to be a meaningful parity test"
+    assert len({e[1] for e in exp}) >= 4, "fixture must exercise most genomes"
     assert got == exp
