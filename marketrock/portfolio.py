@@ -35,7 +35,7 @@ from .strategy import Costs, Limits, run
 
 DEFAULT_CONFIG = {
     "max_risk_per_trade_usd": 250.0,   # YOUR ceiling on automatic sizing
-    "probe_risk_usd": 100.0,           # smallest risk that can trade (~1 contract); overrides staging
+    "probe_risk_usd": 10.0,            # smallest risk that can trade (~1 MES contract at an 8-tick stop)
     "trailing_dd_usd": 2500.0,
     "daily_loss_usd": 1000.0,
     "buffer_usd": 150.0,
@@ -50,10 +50,10 @@ DEFAULT_CONFIG = {
     "holdout_sessions": 20,
     "tune_children": 12,
     "halted": False,
-    # instrument (ES defaults) - must match the chart NT8 trades
+    # instrument: MES (Micro E-mini S&P 500) - must match the chart NT8 trades
     "tick": 0.25,
-    "tick_value": 12.5,
-    "commission_rt": 4.5,
+    "tick_value": 1.25,
+    "commission_rt": 1.5,
     "slip_ticks": 1.0,
 }
 SHRINK_N0 = 20

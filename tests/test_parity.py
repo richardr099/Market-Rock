@@ -135,7 +135,7 @@ def test_csharp_replay_matches_python(tmp_path):
             continue
         g = genomes[sig_g[j]]
         st = max(1, int(np.floor(g.stop_atr * f.atr[j] / 0.25 + 0.5)))
-        q = int(np.floor(500.0 / (st * 12.5)))
+        q = int(np.floor(500.0 / (st * 1.25)))   # MES tick value
         if q >= 1:
             exp.append((int(pyb.time[j]), g.id, int(sig_dir[j]), q, st, max(1, int(np.floor(st * g.target_rr + 0.5)))))
     got = []

@@ -49,7 +49,7 @@ static class Driver
         st.State = State.SetDefaults; call("OnStateChange", new object[0]);
         st.DataDir = args[1]; st.ExportHistory = true;
         st.MaxRiskPerTradeUsd = 5000; st.DailyLossLimitUsd = 1e12; st.TrailingDrawdownUsd = 1e12; st.AccountStartBalance = 1e12; st.ConsistencyBaseUsd = 1e12;
-        st.TickSize = 0.25; st.Instrument = new Instrument(); st.Instrument.MasterInstrument.PointValue = 50;
+        st.TickSize = 0.25; st.Instrument = new Instrument(); st.Instrument.MasterInstrument.PointValue = 5; // MES
         st.Position = new Position(); st.PositionAccount = new Position(); st.Account = new Account();
         st.SystemPerformance = new SystemPerformanceT();
         var b0 = new Bars(); var b1 = new Bars(); st.BarsArray = new[] { b0, b1 };

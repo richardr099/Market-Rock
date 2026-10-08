@@ -1,6 +1,6 @@
 # Market-Rock
 
-A self-developing intraday futures system:
+A self-developing intraday futures system for **MES** (Micro E-mini S&P 500):
 
 * **Python** (NumPy/Numba) invents, tests and manages strategies. Strategies are
   *genomes* (rules built from order-flow and Auction-Market-Theory conditions). A
@@ -64,11 +64,11 @@ docs/REPORT.md                      gaps, red-team log, the maths
    * `max_risk_per_trade_usd`: **your ceiling on automatic sizing**. To let the system
      size fully on its own, set it to your hard per-trade limit. To approve every
      increase yourself, keep it at your current size and raise it when you choose.
-   * Instrument costs (`tick`, `tick_value`, `commission_rt`, `slip_ticks`). **MES is
-     recommended** (`tick_value: 1.25`). With prop-sized drawdowns the optimal size is
-     often below one ES contract (REPORT finding A-21).
+   * Instrument: defaults are **MES** (Micro E-mini S&P 500: tick 0.25, $1.25/tick).
+     Set `commission_rt` to your broker's round-trip cost per contract (default $1.50
+     including fees). MES gives the sizing maths 1/10-ES granularity (REPORT finding A-21).
    * `trailing_dd_usd`, `daily_loss_usd`, `buffer_usd`: copy your firm's rules.
-4. On a 1-minute chart with tick history loaded, enable the strategy once with
+4. On a **1-minute MES chart** (front month) with tick history loaded, enable the strategy once with
    **Export historical bars** on. That writes `bars_history.csv` (training data). Then
    set the **Hard limits** group, including **Max risk per trade**, and enable it on the
    account (**sim first**).

@@ -41,7 +41,7 @@ def test_noise_never_goes_live(tmp_path):
 def test_planted_edge_is_discovered_paper_traded_and_promoted(tmp_path):
     d = _d(tmp_path)
     cli.main(d + ["init", "--approver", "Op"])
-    for p in _nights(tmp_path, edge=3.0, seed=4):
+    for p in _nights(tmp_path, edge=4.0, seed=4):
         assert cli.main(d + ["evolve", "--bars", str(p)]) == 0
     entries, _ = store.read_live(tmp_path / "live")
     assert len(entries) >= 1
@@ -69,7 +69,7 @@ def test_planted_edge_is_discovered_paper_traded_and_promoted(tmp_path):
 def test_halt_resume_rollback_and_log_rotation(tmp_path):
     d = _d(tmp_path)
     cli.main(d + ["init", "--approver", "Op"])
-    nights = _nights(tmp_path, edge=3.0, seed=4)
+    nights = _nights(tmp_path, edge=4.0, seed=4)
     for p in nights:
         cli.main(d + ["evolve", "--bars", str(p)])
     live_before, h_before = store.read_live(tmp_path / "live")

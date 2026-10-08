@@ -79,13 +79,13 @@ def test_same_bar_stop_and_target_assumes_stop():
     o = np.full(4, 100.0); c = np.full(4, 100.0)
     h = np.array([100, 100, 110, 100.0]); l = np.array([100, 100, 90, 100.0])
     out = _simulate(s, o, h, l, c, np.full(4, 4.0), np.array([0, 1, 0, 0]), np.array([-1, 0, -1, -1]),
-                    np.array([1.0]), np.array([1.0]), np.array([50]), np.array([1000.0]),
-                    0.25, 12.5, 0.0, 0.0, 1e9, 1e9)
-    # stop = 1.0 x ATR(4) = 16 ticks; qty = floor(1000 / (16 x 12.5)) = 5; loss = 4 pts x $50 x 5
+                    np.array([1.0]), np.array([1.0]), np.array([50]), np.array([100.0]),
+                    0.25, 1.25, 0.0, 0.0, 1e9, 1e9)
+    # MES: stop = 1.0 x ATR(4) = 16 ticks; qty = floor(100 / (16 x 1.25)) = 5; loss = 4 pts x $5 x 5
     assert out[7][0] == EXIT_STOP
     assert out[3][0] == 5
-    assert out[4][0] == pytest.approx(-1000.0)
-    assert out[5][0] == pytest.approx(1000.0)        # planned risk recorded -> R = -1
+    assert out[4][0] == pytest.approx(-100.0)
+    assert out[5][0] == pytest.approx(100.0)         # planned risk recorded -> R = -1
 
 
 def test_costs_reduce_pnl_and_daily_lock_stops_trading():

@@ -5,7 +5,10 @@
 // (tests/test_parity.py replays ticks through this file and compares).
 //
 // Design summary (see docs/ARCHITECTURE.md):
-//  * Primary series: 1-minute bars (apply the strategy to a 1-minute chart).
+//  * Instrument: MES (Micro E-mini S&P 500). Primary series: 1-minute bars
+//    (apply the strategy to a 1-minute MES chart). Sizing is in dollars and
+//    uses the instrument's own PointValue, so contract counts are always right
+//    for the chart it runs on.
 //    Secondary series: 1-tick, used to classify volume with the TICK RULE.
 //    The tick rule is used both historically and live, so the bar log the
 //    Python learner trains on is produced by the same classifier that trades.
@@ -164,7 +167,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                 ConsistencyBaseUsd = 3000;
                 KnownFloorUsd = 0;
                 MaxRiskPerTradeUsd = 250;
-                CommissionPerContractRt = 4.5;
+                CommissionPerContractRt = 1.5; // MES round trip incl. fees; set your broker's rate
                 ReconnectCooldownSec = 30;
                 StaleDataSec = 20;
                 DataDir = Path.Combine(NinjaTrader.Core.Globals.UserDataDir, "marketrock");

@@ -29,9 +29,9 @@ VA_PCT = 0.70  # fixed globally: one shared volume profile for every genome
 
 @dataclass(frozen=True)
 class Costs:
-    tick: float = 0.25           # ES
-    tick_value: float = 12.50    # ES
-    commission_rt: float = 4.50  # per contract, round trip
+    tick: float = 0.25           # MES (Micro E-mini S&P 500)
+    tick_value: float = 1.25     # MES: $5 per point
+    commission_rt: float = 1.50  # per contract, round trip incl. exchange fees (set yours in config.json)
     slip_ticks: float = 1.0      # per side
 
 
